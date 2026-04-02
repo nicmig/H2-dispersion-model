@@ -69,9 +69,49 @@ SENSOR_POSITIONS = {
 }
 
 
+def process_and_resample_cfd_sensor(data_file, sensor_num, scenario_name, mass_flow):
+    """Process and resample a single CFD sensor's data."""
+    df = pd.read_csv(data_file)
+    x, y, z = SENSOR_POSITIONS[sensor_num]
+    
+    # Shift time to start from 0
+    t_min = df['time'].min()
+    df['time'] = df['time'] - t_min
+    
+    # Resample from 100Hz to 1.6Hz
+    original_freq = 100
+    target_freq = 1.6
+    num_samples = int(len(df) * target_freq / original_freq)
+    
+    # Resample h2_volume_fraction
+    resampled_h2 = signal.resample(df['h2_volume_fraction'].values, num_samples)
+    resampled_h2[0] = 0.
+    new_time = np.linspace(df['time'].iloc[0], df['time'].iloc[-1], num_samples)
+    
+    # Add small noise to zero values to avoid exact zeros
+    resampled_h2 = np.maximum(resampled_h2, 0)
+    resampled_h2 = np.where(resampled_h2 == 0, 1e-8, resampled_h2)
+    
+    # Create resampled dataframe for this sensor
+    records = []
+    for i in range(num_samples):
+        records.append({
+            'time': new_time[i],
+            'mass_flow': mass_flow,
+            'sensor_id': sensor_num,
+            'x': x, 'y': y, 'z': z,
+            'h2_volume_fraction': resampled_h2[i],
+            'source': 'cfd',
+            'scenario': scenario_name,
+            'experiment_id': f'CFD_{scenario_name}'
+        })
+    
+    return pd.DataFrame(records)
+
+
 def process_cfd_scenario(scenario_dir, scenario_name):
     """Process all sensors in a CFD scenario."""
-    records = []
+    all_sensor_dfs = []
     mass_flow = CFD_MASS_FLOW.get(scenario_name, np.nan)
     
     sensor_dirs = [d for d in scenario_dir.iterdir() 
@@ -84,27 +124,14 @@ def process_cfd_scenario(scenario_dir, scenario_name):
         if not data_file.exists():
             continue
         
-        df = pd.read_csv(data_file)
-        x, y, z = SENSOR_POSITIONS[sensor_num]
-        
-        # Use h2_volume_fraction directly (already in correct unit)
-        # Add small noise to zero values to avoid exact zeros
-        for _, row in df.iterrows():
-            h2_vf = row['h2_volume_fraction']
-            if h2_vf == 0:
-                h2_vf = 1e-8  # Small noise to avoid exact zero
-            records.append({
-                'time': row['time'],
-                'mass_flow': mass_flow,
-                'sensor_id': sensor_num,
-                'x': x, 'y': y, 'z': z,
-                'h2_volume_fraction': h2_vf,
-                'source': 'cfd',
-                'scenario': scenario_name,
-                'experiment_id': f'CFD_{scenario_name}'
-            })
+        # Process and resample each sensor individually
+        df_sensor = process_and_resample_cfd_sensor(data_file, sensor_num, scenario_name, mass_flow)
+        if not df_sensor.empty:
+            all_sensor_dfs.append(df_sensor)
     
-    return pd.DataFrame(records)
+    if all_sensor_dfs:
+        return pd.concat(all_sensor_dfs, ignore_index=True)
+    return pd.DataFrame()
 
 
 def extract_mean_mass_flow(df_exp):
@@ -211,29 +238,6 @@ def process_experiment(exp_file, exp_name):
     return pd.DataFrame()
 
 
-def shift_time_to_zero(df):
-    """Shift time so that minimum time is 0."""
-    df = df.copy()
-    t_min = df['time'].min()
-    df['time'] = df['time'] - t_min
-    return df
-
-def resample_data(df, original_freq=100, target_freq=1.6):
-    num_samples = int(len(df) * target_freq / original_freq)
-    resampled_data = signal.resample(df['h2_volume_fraction'].values, num_samples)
-    new_time = np.linspace(df['time'].iloc[0], df['time'].iloc[-1], num_samples)
-    resampled_data[0] = 0.0
-    resampled_data = np.maximum(resampled_data, 0)
-    resampled_data = np.where(resampled_data == 0, 1e-8, resampled_data)
-    df_resampled = pd.DataFrame({'time': new_time, 'h2_volume_fraction': resampled_data})
-    df_other = df.drop(columns=['h2_volume_fraction']) 
-    return pd.merge_asof(
-        df_resampled.sort_values('time'),
-        df_other.sort_values('time'),
-        on='time',
-        direction='nearest'
-    )
-
 def shift_time_to_mass_flow_start(df, exp_name):
     """Shift time so that time starts when mass flow starts."""
     df = df.copy()
@@ -276,8 +280,7 @@ def main():
         logger.info(f"Processing CFD scenario {scenario}...")
         df_cfd = process_cfd_scenario(scenario_dir, scenario)
         if not df_cfd.empty:
-            df_cfd = shift_time_to_zero(df_cfd)
-            df_cfd = resample_data(df_cfd)
+            # Each sensor is already resampled individually in process_cfd_scenario
             df_cfd['split'] = 'train'
             all_data.append(df_cfd)
             logger.info(f"  Added {len(df_cfd)} records (mass_flow: {df_cfd['mass_flow'].iloc[0]:.3f}, H2 max: {df_cfd['h2_volume_fraction'].max():.4f})")
@@ -299,8 +302,8 @@ def main():
         df_exp = process_experiment(exp_file, exp_name)
         if not df_exp.empty:
             df_exp = shift_time_to_mass_flow_start(df_exp, exp_name)
-            # Filter: keep only data up to 200 seconds after mass flow start
-            df_exp = df_exp[df_exp['time'] <= 200]
+            # Filter: keep only data up to 240 seconds after mass flow start
+            df_exp = df_exp[df_exp['time'] <= 240]
             df_exp['split'] = assign_split(df_exp, exp_name)
             split_name = df_exp['split'].iloc[0]
             all_data.append(df_exp)
