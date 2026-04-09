@@ -196,16 +196,15 @@ class H2DispersionInference:
     def _mcmc_sampler(self, time, observed_sensors, observed_values, n_samples=100):
         """Simple Metropolis-Hastings sampler for mass flow posterior."""
         samples = []
-        current_m = self.mass_flow_prior_mean
-        current_log_p = self._compute_log_likelihood(current_m, time, 
-                                                      observed_sensors, observed_values)
+        current_m = self.mass_flow_prior_mean # initial state
+        current_log_p = self._compute_log_likelihood(current_m, time, observed_sensors, observed_values)
         
-        proposal_std = 0.1
+        proposal_std = 0.3
         n_accepted = 0
         
         for i in range(n_samples + 500):  # Burn-in
             proposal = current_m + np.random.normal(0, proposal_std)
-            proposal = np.clip(proposal, *self.mass_flow_bounds)
+            proposal = np.clip(proposal, *self.mass_flow_bounds) # clip mass flows that are out of bounds
             
             proposal_log_p = self._compute_log_likelihood(proposal, time,
                                                           observed_sensors, observed_values)
@@ -247,7 +246,7 @@ class H2DispersionInference:
         X_grid_t = torch.tensor(X_grid, dtype=torch.float64, device=self.device)
         
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            pred = self.likelihood(self.gp(X_grid_t))
+            pred = self.gp(X_grid_t)
             mean_log = pred.mean.cpu().numpy()
             std_log = pred.stddev.cpu().numpy()
         
@@ -325,57 +324,6 @@ class H2DispersionInference:
             total_uncertainty=total_unc,
             inference_time_ms=inference_time
         )
-    
-    def detect_sensor_faults(self,
-                            time: float,
-                            sensor_readings: Dict[int, float],
-                            threshold_sigma: float = 3.0) -> Dict[int, Dict]:
-        """
-        Detect inconsistent sensors using leave-one-out cross-validation.
-        
-        Args:
-            time: Current time
-            sensor_readings: Dict of {sensor_id: h2_concentration}
-            threshold_sigma: Z-score threshold for flagging faults
-        
-        Returns:
-            Dict of faulty sensors with diagnostic info
-        """
-        anomalies = {}
-        all_sensors = list(sensor_readings.keys())
-        
-        for test_sensor in all_sensors:
-            # Use all other sensors to predict this one
-            other_sensors = [s for s in all_sensors if s != test_sensor]
-            if len(other_sensors) < 2:
-                continue
-                
-            other_readings = {s: sensor_readings[s] for s in other_sensors}
-            
-            # Infer mass flow without this sensor
-            mf_result = self.infer_mass_flow(time, other_readings, method='map')
-            
-            # Predict at test sensor location
-            _, y_test, z_test = self.sensor_positions[test_sensor]
-            test_point = np.array([[y_test, z_test]])
-            
-            pred_mean, pred_std = self.predict_field(
-                time, mf_result['map_estimate'], test_point
-            )
-            
-            observed = sensor_readings[test_sensor]
-            z_score = (observed - pred_mean[0]) / (pred_std[0] + 1e-6)
-            
-            if abs(z_score) > threshold_sigma:
-                anomalies[test_sensor] = {
-                    'observed': observed,
-                    'predicted': pred_mean[0],
-                    'predicted_std': pred_std[0],
-                    'z_score': z_score,
-                    'severity': 'CRITICAL' if abs(z_score) > 5 else 'WARNING'
-                }
-        
-        return anomalies
     
     def plot_sensor_comparison(self, time, sensor_readings, save_path=None):
         """Plot comparison of predicted vs observed sensor values."""
