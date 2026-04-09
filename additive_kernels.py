@@ -25,7 +25,7 @@ from typing import Optional
 
 class FullAdditiveKernel(Kernel):
     """
-    Full Additive Kernel as introduced by Duvenaud et al. (2011).
+    Naive Full Additive Kernel as introduced by Duvenaud et al. (2011).
     
     This kernel decomposes the function into a sum of interactions of all orders:
     - 1st order: individual dimensions
@@ -36,7 +36,7 @@ class FullAdditiveKernel(Kernel):
     The kernel is defined as:
     k(x, x') = Σ_{d=1}^D Σ_{|S|=d} σ²_S ∏_{i∈S} k_i(x_i, x'_i)
     
-    For D dimensions, there are 2^D - 1 terms (all non-empty subsets).
+    For D dimensions, there are 2^D - 1 terms.
     
     Args:
         base_kernels: List of scalable base kernels, one per dimension
@@ -48,12 +48,16 @@ class FullAdditiveKernel(Kernel):
         >>> k3 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
         >>> additive_kernel = FullAdditiveKernel([k1, k2, k3])
         >>> 
-        >>> # This creates: k = σ²₁k₁ + σ²₂k₂ + σ²₃k₃ + σ²₁₂k₁k₂ + σ²₁₃k₁k₃ + σ²₂₃k₂k₃ + σ²₁₂₃k₁k₂k₃
+        >>> # This creates: k = σ²₁k₁ + σ²₂k₂ + σ²₃k₃ + σ²₁k₁σ²₂k₂ + σ²₁k₁σ²₃k₃ + σ²₂k₂σ²₃k₃ + σ²₁k₁σ²₂k₂σ²₃k₃
     
     Reference:
         Duvenaud, D., Nickisch, H., & Rasmussen, C. (2011).
         "Additive Gaussian Processes." NIPS 2011.
     """
+
+    @property
+    def is_stationary(self) -> bool:
+        return all(k.is_stationary for k in self.base_kernels)
     
     def __init__(
         self,
