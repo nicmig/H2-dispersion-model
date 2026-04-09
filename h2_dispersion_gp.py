@@ -1,17 +1,22 @@
 """
-Latent Mass Flow GP for H2 Dispersion Prediction
+GP for H2 Dispersion Prediction
 
 During operation:
 - INPUT: time, sensor observations {sensor_id: h2_concentration}
-- OUTPUT: concentration field prediction + mass flow estimate + uncertainty
+- OUTPUT: concentration field prediction + uncertainty
 
 Training:
-- INPUT: time, mass_flow, y, z (from CFD + experiments) - x removed as domain is 1D in x
+- INPUT: time, mass_flow, y, z (from CFD + experiments)
 - OUTPUT: h2_concentration
 """
 
+import warnings
+warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
+
+from gpytorch.distributions import MultivariateNormal
 import torch
 import gpytorch
+from gpytorch.variational.nearest_neighbor_variational_strategy import NNVariationalStrategy
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Union
@@ -23,6 +28,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 from scipy.cluster.vq import kmeans2
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import additive kernels
@@ -154,6 +160,34 @@ class ExactGPModel(gpytorch.models.ExactGP):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+    
+
+class VNNGP(gpytorch.models.ApproximateGP):
+    def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256):
+
+        m, d = inducing_points.shape
+        self.m = m
+        self.k = k
+
+        variational_distribution = gpytorch.variational.MeanFieldVariationalDistribution(m)
+
+        variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.001)
+
+        super(VNNGP, self).__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = FullAdditiveKernel(base_kernel_type='matern32', num_dims=4)
+
+        self.likelihood = likelihood
+    def forward(self, x: torch.Tensor):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    def __call__(self, x: torch.Tensor | None, prior: bool = False, **kwargs) -> MultivariateNormal:
+        if x is not None:
+            if x.dim() == 1:
+                x = x.unsqueeze(-1)
+        return self.variational_strategy(x=x, prior=False, **kwargs)
 
 
 # ============================================================================
@@ -176,8 +210,8 @@ def select_inducing_points(X_train, n_inducing=1000, method='kmeans'):
     
     if method == 'kmeans' and n_train > n_inducing:
         print(f"Selecting {n_inducing} inducing points via K-means...")
-        centroid, _ = kmeans2(X_train, k=n_inducing, iter=100, minit='random')
-        inducing_points = torch.tensor(centroid, dtype=torch.float32)
+        centroid, _ = kmeans2(X_train, k=n_inducing, iter=10, minit='random')
+        inducing_points = torch.tensor(centroid, dtype=torch.float64)
     elif method == 'random':
         print(f"Randomly selecting {n_inducing} inducing points...")
         indices = np.random.choice(n_train, size=n_inducing, replace=False)
@@ -191,7 +225,7 @@ def select_inducing_points(X_train, n_inducing=1000, method='kmeans'):
     inducing_points_np = np.unique(inducing_points_np, axis=0)
     if len(inducing_points_np) < len(inducing_points):
         print(f"  Removed {len(inducing_points) - len(inducing_points_np)} duplicate inducing points")
-        inducing_points = torch.tensor(inducing_points_np, dtype=torch.float32)
+        inducing_points = torch.tensor(inducing_points_np, dtype=torch.float64)
     
     return inducing_points
 
@@ -308,6 +342,7 @@ def train_h2_dispersion_gp(df_train,
 
 def train_h2_dispersion_gp_approximate_additive(df_train,
                                        n_inducing: int = 500,
+                                       model_type: str = "VNNGP",
                                        likelihood_type: str = 'gaussian',
                                        n_epochs: int = 200,
                                        learning_rate: float = 0.01,
@@ -333,29 +368,36 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
         model, likelihood, history: Trained model, likelihood, and training history
     """
     # Prepare training data
+    x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
     X = df_train[['time', 'mass_flow', 'y', 'z']].values
+    x_scaler.fit(X)
+    x_scaled = x_scaler.transform(X)
     y = df_train['h2_volume_fraction'].values
     y_log = np.log(y + LOG_EPSILON)
-    
-    X_train = torch.tensor(X, dtype=torch.float32, device=device)
-    y_train = torch.tensor(y_log, dtype=torch.float32, device=device)
+    y_scaler.fit(y_log.reshape(-1,1))
+    y_scaled = y_scaler.transform(y_log.reshape(-1,1))
 
-    train_dataset = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
+    x_train = torch.tensor(x_scaled, dtype=torch.float64, device=device).contiguous()
+    y_train = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
+
+    train_dataset = TensorDataset(x_train, y_train.squeeze())
+    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
 
     # Prepare validation data
     X_val = df_val[['time', 'mass_flow', 'y', 'z']].values
+    x_val_scaled = x_scaler.transform(X_val)
     y_val = df_val['h2_volume_fraction'].values
     y_val_log = np.log(y_val + LOG_EPSILON)
-    
-    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_val_t = torch.tensor(y_val_log, dtype=torch.float32, device=device)
+    y_val_scaled = y_scaler.transform(y_val_log.reshape(-1,1))
 
-    val_dataset = TensorDataset(X_val_t, y_val_t)
-    val_loader = DataLoader(val_dataset, batch_size=1024, shuffle=False)
+    X_val_t = torch.tensor(x_val_scaled, dtype=torch.float64, device=device).contiguous()
+    y_val_t = torch.tensor(y_val_scaled, dtype=torch.float64, device=device).contiguous()
+
+    val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
+    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
     
-    print(f"\nTraining data: {len(X_train):,} points")
-    print(f"Inducing points: {n_inducing}")
+    print(f"\nTraining data: {len(x_train):,} points")
     print(f"Input dimensions: time, mass_flow, y, z")
     print(f"Target: log(y + {LOG_EPSILON})")
     
@@ -364,86 +406,143 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
         logger = ExperimentLogger()
     
     logger.log_training_start({
-        'n_train': len(X_train),
+        'n_train': len(x_train),
         'n_inducing': n_inducing,
         'n_epochs': n_epochs,
         'learning_rate': learning_rate,
         'device': device,
-        'model_type': 'SparseH2DispersionGP (Approximate)',
+        'model_type': model_type,
         'target_transform': f'log(y + {LOG_EPSILON})',
     })
     
-    # Select inducing points using k-means
-    inducing_points = select_inducing_points(X, n_inducing=n_inducing, method='kmeans')
-    inducing_points = inducing_points.to(device)
-    
     # Create approximate GP model
     if likelihood_type == 'gaussian':
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
     elif likelihood_type == 'beta':
         likelihood = gpytorch.likelihoods.BetaLikelihood().to(device)
     else:
         raise ValueError(f"Unknown likelihhod type: {likelihood_type}")
+    
+    if model_type == "SVGP":
+        # Select inducing points using k-means
+        inducing_points = select_inducing_points(X, n_inducing=n_inducing, method='kmeans')
+        inducing_points = inducing_points.to(device) 
+        model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
+        model.train()
+        likelihood.train()
+        optimizer = torch.optim.AdamW([{'params' : model.parameters()}, {'params': likelihood.parameters()}], lr=learning_rate)
+
+        print(f"\nModel: SparseH2DispersionGP (Approximate GP)")
+        print(f"Variational parameters: {n_inducing} inducing points")
+
+        #mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=len(X_train))
+        mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
         
-    model = SparseH2DispersionGP(inducing_points=inducing_points).to(device)
+        history = {
+            'train_epoch_loss': [],
+            'epochs': [],
+        }
+        
+        print(f"\nTraining for {n_epochs} epochs...")
+        print("-" * 60)
+        
+        start_time = time_module.time()
+        
+        iterator = tqdm(range(n_epochs), desc="Training  SVGP")
+        for epoch in iterator:
+            loss_epoch = 0.
+            minibatch_iter = tqdm(train_loader, desc="Minibatch", leave=False)
+            with gpytorch.settings.cholesky_jitter():
+                for x_batch, y_batch in minibatch_iter:
+                    optimizer.zero_grad()
+                    output = model(x_batch)
+                    loss = -mll(output, y_batch)
+                    loss_train = loss.detach().item()
+                    minibatch_iter.set_postfix(loss=loss_train)
+                    loss_epoch += loss_train
+                    loss.backward()
+                    optimizer.step()
+
+            epoch_loss = float(loss_epoch) / float(len(minibatch_iter))    
+            iterator.set_postfix(epoch_loss=f"{epoch_loss:.4f}")
+            history['train_epoch_loss'].append(epoch_loss)
+            history['epochs'].append(epoch)
+            if model_path is not None:
+                path = model_path + str(epoch)
+                save_checkpoint(model, likelihood, history, path, model_type=model_type)
+        
+        training_time = time_module.time() - start_time
+
+    elif model_type == "VNNGP":
+        k = 256
+        training_batch_size = 128
+        y_train = y_train.squeeze()
+        model = VNNGP(inducing_points=x_train, likelihood=likelihood, k=k, training_batch_size=training_batch_size).double().to(device)
+        num_batches = model.variational_strategy._total_training_batches
+        model.train()
+        likelihood.train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
-    print(f"\nModel: SparseH2DispersionGP (Approximate GP)")
-    print(f"Variational parameters: {n_inducing} inducing points")
-    
-    # Training
-    model.train()
-    likelihood.train()
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    #mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=len(X_train))
-    mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
-    
-    history = {
-        'train_loss': [],
+        print(f"\nModel: VNNGP (Approximate GP)")
+
+        mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=y_train.size(0))
+        #mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
+
+        history = {
+        'train_epoch_loss': [],
         'epochs': [],
-    }
-    
-    print(f"\nTraining for {n_epochs} epochs...")
-    print("-" * 60)
-    
-    start_time = time_module.time()
-    
-    iterator = tqdm(range(n_epochs), desc="Training Approximate GP")
-    for epoch in iterator:
-        loss_epoch = 0.
-        minibatch_iter = tqdm(train_loader, desc="Minibatch", leave=False)
-        with gpytorch.settings.cholesky_jitter():
-            for x_batch, y_batch in minibatch_iter:
-                optimizer.zero_grad()
-                output = model(x_batch)
-                loss = -mll(output, y_batch)
-                minibatch_iter.set_postfix(loss=f"{loss.item():.4f}")
-                loss_epoch += loss.item()
-                loss.backward()
-                optimizer.step()
-                
-        iterator.set_postfix(epoch_loss=f"{loss_epoch/len(minibatch_iter):.4f}")
-        history['train_loss'].append(loss_epoch/len(minibatch_iter))
-        history['epochs'].append(epoch)
-    
-    training_time = time_module.time() - start_time
+        }
+        
+        print(f"\nTraining for {n_epochs} epochs...")
+        print("-" * 60)
+
+        start_time = time_module.time()
+        iterator = tqdm(range(n_epochs), desc="Training VNNGP")
+        for epoch in iterator:
+            loss_epoch = 0.
+            minibatch_iter = tqdm(range(num_batches), desc="Minibatch", leave=False)
+            with gpytorch.settings.cholesky_jitter():
+                for i in minibatch_iter:
+                    optimizer.zero_grad()
+                    output = model(x=None)
+                    current_training_indices = model.variational_strategy.current_training_indices
+                    y_batch = y_train[..., current_training_indices]
+                    loss = -mll(output, y_batch)
+                    loss_train = loss.detach().item()
+                    minibatch_iter.set_postfix(loss=loss_train)
+                    loss_epoch += loss_train
+                    loss.backward()
+                    optimizer.step()
+
+            epoch_loss = float(loss_epoch) / float(len(minibatch_iter))
+            iterator.set_postfix(epoch_loss=f"{epoch_loss:.4f}")
+            history['train_epoch_loss'].append(epoch_loss)
+            history['epochs'].append(epoch)
+            if model_path is not None:
+                path = model_path + str(epoch)
+                save_checkpoint(model, likelihood, history, path, model_type=model_type)
+        
+        training_time = time_module.time() - start_time
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
     print(f"\nTraining complete! Duration: {training_time/60:.2f} minutes")
-    print(f"Final training loss: {history['train_loss'][-1]:.4f}")
+    print(f"Final training loss: {history['train_epoch_loss'][-1]:.4f}")
     
     # Save model if path provided
     if model_path:
-        save_checkpoint(model, likelihood, history, model_path, model_type='approximate_gp')
+        save_checkpoint(model, likelihood, history, model_path, model_type=model_type)
     
     logger.log_training_end(
         best_epoch=n_epochs,
-        best_val_loss=history['train_loss'][-1],
+        best_val_loss=history['train_epoch_loss'][-1],
         total_time=training_time
     )
 
     model.eval()
     likelihood.eval()
     means = torch.tensor([0.])
+    print("Ready to evaluate.")
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
             preds = model(x_batch)
@@ -451,14 +550,25 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
     means = means[1:]
 
     # Convert to original scale for MAE/RMSE
-    pred_mean_orig = torch.exp(means) - LOG_EPSILON
-    y_val_orig = torch.exp(y_val_t) - LOG_EPSILON
+    pred_mean_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(means.numpy().reshape(-1, 1)))) - LOG_EPSILON
+    y_val_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(y_val_t.cpu().numpy().reshape(-1, 1)))) - LOG_EPSILON
     
     # Ensure non-negative for MAE/RMSE calculation
     pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
     
     mae = torch.mean(torch.abs(pred_mean_orig - y_val_orig)).item()
     rmse = torch.sqrt(torch.mean((pred_mean_orig - y_val_orig) ** 2)).item()
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(history['epochs'], history['train_epoch_loss'], label='Train Epoch Loss', marker='s', markersize=4)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss over Epochs')
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    fig_name = model_type + str(k)
+    plt.savefig(fig_name)
 
     print(f"Validation MAE: {mae:.4f}")
     print(f"Validation RMSE: {rmse:.4f}")
@@ -487,6 +597,7 @@ def save_checkpoint(model, likelihood, history, path, model_type='gp'):
         'model_state_dict': model.state_dict(),
         'likelihood_state_dict': likelihood.state_dict(),
         'history': history,
+        'epoch': history['epochs'],
         'model_type': model_type,
         'log_epsilon': LOG_EPSILON,
     }
@@ -615,71 +726,6 @@ def train_h2_dispersion_gp_exact_additive(df_train,
     )
     
     return model, likelihood, history
-
-
-def validate_gp_model(model, likelihood, df_val, device='cpu'):
-    """
-    Validate trained GP model on validation set.
-    
-    Returns MAE and RMSE computed on original (non-log) scale.
-    
-    Args:
-        model: Trained GP model
-        likelihood: Model likelihood
-        df_val: Validation dataframe
-        device: 'cpu' or 'cuda'
-    
-    Returns:
-        metrics: Dict with 'mae', 'rmse', 'nll'
-    """
-    print("\n" + "=" * 60)
-    print("VALIDATION")
-    print("=" * 60)
-    
-    # Prepare validation data
-    X_val = df_val[['time', 'mass_flow', 'y', 'z']].values
-    y_val = df_val['h2_volume_fraction'].values
-    y_val_log = np.log(y_val + LOG_EPSILON)
-    
-    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_val_t = torch.tensor(y_val_log, dtype=torch.float32, device=device)
-    
-    print(f"Validation data: {len(X_val_t):,} points")
-    
-    model.eval()
-    likelihood.eval()
-    
-    with torch.no_grad():
-        # Get predictions
-        pred = likelihood(model(X_val_t))
-        pred_mean = pred.mean
-        
-        # Compute NLL (in log space)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-        nll = -mll(pred, y_val_t)
-        
-        # Convert to original scale for MAE/RMSE
-        pred_mean_orig = torch.exp(pred_mean) - LOG_EPSILON
-        y_val_orig = torch.exp(y_val_t) - LOG_EPSILON
-        
-        # Ensure non-negative for MAE/RMSE calculation
-        pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
-        
-        mae = torch.mean(torch.abs(pred_mean_orig - y_val_orig)).item()
-        rmse = torch.sqrt(torch.mean((pred_mean_orig - y_val_orig) ** 2)).item()
-    
-    metrics = {
-        'mae': mae,
-        'rmse': rmse,
-        'nll': nll.item(),
-    }
-    
-    print(f"\nValidation Metrics:")
-    print(f"  NLL:  {nll:.4f}")
-    print(f"  MAE:  {mae:.6f}")
-    print(f"  RMSE: {rmse:.6f}")
-    
-    return metrics
 
 
 def evaluate_gp_model(model, likelihood, df_test, device='cpu'):
@@ -1019,11 +1065,12 @@ if __name__ == "__main__":
 
     model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
         df_train=df_train,
-        n_inducing=2000,
-        n_epochs=200,
-        learning_rate=0.1,
-        device='cuda',
+        n_inducing=6000,
+        model_type="VNNGP",
+        likelihood_type="gaussian",
+        n_epochs=100,
+        learning_rate=0.01,
+        device='cuda:0',
         logger=logger,
-        model_path='models/approximate_gp.pth'
+        model_path='models/approximate_vnngp_matern32_k256.pth'
     )
-    
