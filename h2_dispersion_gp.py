@@ -9,6 +9,8 @@ Training:
 - INPUT: time, mass_flow, y, z (from CFD + experiments)
 - OUTPUT: h2_concentration
 """
+"""import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'"""
 
 import warnings
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
@@ -32,7 +34,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import additive kernels
-from additive_kernels import ExactGPAdditiveModel, FullAdditiveKernel
+from additive_kernels import ScaleAdditiveKernel, FullAdditiveKernel
 
 # Log transform epsilon to avoid log(0) - data has small values ~1e-8
 LOG_EPSILON = 1e-6
@@ -162,6 +164,7 @@ class ExactGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
     
 
+
 class VNNGP(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256):
 
@@ -175,7 +178,8 @@ class VNNGP(gpytorch.models.ApproximateGP):
 
         super(VNNGP, self).__init__(variational_strategy)
         self.mean_module = gpytorch.means.ZeroMean()
-        self.covar_module = FullAdditiveKernel(base_kernel_type='matern32', num_dims=4)
+        #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
+        self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=4) # less output scale parameters and more interpretable
 
         self.likelihood = likelihood
     def forward(self, x: torch.Tensor):
@@ -340,15 +344,18 @@ def train_h2_dispersion_gp(df_train,
     return model, likelihood, history
 
 
-def train_h2_dispersion_gp_approximate_additive(df_train,
+def train_h2_dispersion_gp_approximate_additive(df,
+                                        split_ratio: float = 0.3,
                                        n_inducing: int = 500,
+                                       k: int = 64,
+                                       training_batch_size: int = 512,
                                        model_type: str = "VNNGP",
                                        likelihood_type: str = 'gaussian',
                                        n_epochs: int = 200,
                                        learning_rate: float = 0.01,
                                        device: str = 'cpu',
-                                       logger: Optional[ExperimentLogger] = None,
-                                       model_path: Optional[str] = None):
+                                       model_path: Optional[str] = None,
+                                       trained_model: Optional[str] = None):
     """
     Train Sparse Variational GP (Approximate GP) with inducing points.
     
@@ -367,40 +374,97 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
     Returns:
         model, likelihood, history: Trained model, likelihood, and training history
     """
+
+    # Split data - only train and test available
+    df_train_full = df[df['split'] == 'train'].copy()
+    #df_test = df[df['split'] == 'test'].copy()
+    
+    print(f"Full train: {len(df_train_full):,} rows")
+    
+    # Split training data into train and validation (80/20 split by scenarios)
+    split_ratio = split_ratio
+    train_scenarios = df_train_full['scenario'].unique()
+    n_val = max(1, int(len(train_scenarios) * split_ratio))
+    np.random.seed(42)
+    val_scenarios = np.random.choice(train_scenarios, size=n_val, replace=False)
+    
+    df_train = df_train_full[~df_train_full['scenario'].isin(val_scenarios)].copy()
+    df_val = df_train_full[df_train_full['scenario'].isin(val_scenarios)].copy()
+    
+    print(f"Split train: {len(df_train):,} rows, Val: {len(df_val):,} rows")
+    print(f"Validation scenarios: {list(val_scenarios)}")
+    
+    # Create experiment logger
+    logger = ExperimentLogger(log_dir='experiments')
+
     # Prepare training data
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-    X = df_train[['time', 'mass_flow', 'y', 'z']].values
-    x_scaler.fit(X)
-    x_scaled = x_scaler.transform(X)
-    y = df_train['h2_volume_fraction'].values
-    y_log = np.log(y + LOG_EPSILON)
-    y_scaler.fit(y_log.reshape(-1,1))
-    y_scaled = y_scaler.transform(y_log.reshape(-1,1))
+    if likelihood_type == "gaussian":
+        x_scaler = StandardScaler()
+        y_scaler = StandardScaler()
+        X = df_train[['time', 'mass_flow', 'y', 'z']].values
+        x_scaler.fit(X)
+        x_scaled = x_scaler.transform(X)
+        y = df_train['h2_volume_fraction'].values
+        y_log = np.log(y + LOG_EPSILON)
+        y_scaler.fit(y_log.reshape(-1,1))
+        y_scaled = y_scaler.transform(y_log.reshape(-1,1))
 
-    x_train = torch.tensor(x_scaled, dtype=torch.float64, device=device).contiguous()
-    y_train = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
+        x_train = torch.tensor(x_scaled, dtype=torch.float64, device=device).contiguous()
+        y_train = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
 
-    train_dataset = TensorDataset(x_train, y_train.squeeze())
-    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+        train_dataset = TensorDataset(x_train, y_train.squeeze())
+        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
 
-    # Prepare validation data
-    X_val = df_val[['time', 'mass_flow', 'y', 'z']].values
-    x_val_scaled = x_scaler.transform(X_val)
-    y_val = df_val['h2_volume_fraction'].values
-    y_val_log = np.log(y_val + LOG_EPSILON)
-    y_val_scaled = y_scaler.transform(y_val_log.reshape(-1,1))
+        # Prepare validation data
+        X_val = df_val[['time', 'mass_flow', 'y', 'z']].values
+        x_val_scaled = x_scaler.transform(X_val)
+        y_val = df_val['h2_volume_fraction'].values
+        y_val_log = np.log(y_val + LOG_EPSILON)
+        y_val_scaled = y_scaler.transform(y_val_log.reshape(-1,1))
 
-    X_val_t = torch.tensor(x_val_scaled, dtype=torch.float64, device=device).contiguous()
-    y_val_t = torch.tensor(y_val_scaled, dtype=torch.float64, device=device).contiguous()
+        X_val_t = torch.tensor(x_val_scaled, dtype=torch.float64, device=device).contiguous()
+        y_val_t = torch.tensor(y_val_scaled, dtype=torch.float64, device=device).contiguous()
 
-    val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
-    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
-    
-    print(f"\nTraining data: {len(x_train):,} points")
-    print(f"Input dimensions: time, mass_flow, y, z")
-    print(f"Target: log(y + {LOG_EPSILON})")
-    
+        val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
+        val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+        
+        print(f"\nTraining data: {len(x_train):,} points")
+        print(f"Input dimensions: time, mass_flow, y, z")
+        print(f"Target: log(y + {LOG_EPSILON})")
+
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
+    elif likelihood_type == 'beta':
+        x_scaler = StandardScaler()
+        X = df_train[['time', 'mass_flow', 'y', 'z']].values
+        x_scaler.fit(X)
+        x_scaled = x_scaler.transform(X)
+        y = df_train['h2_volume_fraction'].values
+        y_beta = np.clip(y, 1e-6, 1 - 1e-6)
+
+        x_train = torch.tensor(x_scaled, dtype=torch.float64, device=device).contiguous()
+        y_train = torch.tensor(y_beta, dtype=torch.float64, device=device).contiguous()
+
+        train_dataset = TensorDataset(x_train, y_train.squeeze())
+        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+
+        # Prepare validation data
+        X_val = df_val[['time', 'mass_flow', 'y', 'z']].values
+        x_val_scaled = x_scaler.transform(X_val)
+        y_val = df_val['h2_volume_fraction'].values
+        y_val_beta = np.clip(y_val, 1e-6, 1 - 1e-6)
+
+        X_val_t = torch.tensor(x_val_scaled, dtype=torch.float64, device=device).contiguous()
+        y_val_t = torch.tensor(y_val_beta, dtype=torch.float64, device=device).contiguous()
+
+        val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
+        val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+        
+        print(f"\nTraining data: {len(x_train):,} points")
+        print(f"Input dimensions: time, mass_flow, y, z")
+
+        likelihood = gpytorch.likelihoods.BetaLikelihood().double().to(device)
+    else:
+        raise ValueError(f"Unknown likelihhod type: {likelihood_type}")
     # Initialize logger
     if logger is None:
         logger = ExperimentLogger()
@@ -412,16 +476,8 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
         'learning_rate': learning_rate,
         'device': device,
         'model_type': model_type,
-        'target_transform': f'log(y + {LOG_EPSILON})',
+        'likelihood_type': likelihood_type
     })
-    
-    # Create approximate GP model
-    if likelihood_type == 'gaussian':
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
-    elif likelihood_type == 'beta':
-        likelihood = gpytorch.likelihoods.BetaLikelihood().to(device)
-    else:
-        raise ValueError(f"Unknown likelihhod type: {likelihood_type}")
     
     if model_type == "SVGP":
         # Select inducing points using k-means
@@ -441,6 +497,8 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
         history = {
             'train_epoch_loss': [],
             'epochs': [],
+            'RMSE': [],
+            'MAE': []
         }
         
         print(f"\nTraining for {n_epochs} epochs...")
@@ -474,10 +532,17 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
         training_time = time_module.time() - start_time
 
     elif model_type == "VNNGP":
-        k = 256
-        training_batch_size = 128
+        k = k
+        training_batch_size = training_batch_size
         y_train = y_train.squeeze()
-        model = VNNGP(inducing_points=x_train, likelihood=likelihood, k=k, training_batch_size=training_batch_size).double().to(device)
+        if trained_model is not None:
+            print("Use pre-trained model.")
+            checkpoint = torch.load(trained_model, map_location=device)
+            model = VNNGP(inducing_points=x_train,likelihood=likelihood, k=k, training_batch_size=training_batch_size).double().to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
+        else:
+            model = VNNGP(inducing_points=x_train, likelihood=likelihood, k=k, training_batch_size=training_batch_size).double().to(device)
         num_batches = model.variational_strategy._total_training_batches
         model.train()
         likelihood.train()
@@ -485,12 +550,14 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
     
         print(f"\nModel: VNNGP (Approximate GP)")
 
-        mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=y_train.size(0))
-        #mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
+        #mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=y_train.size(0))
+        mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
 
         history = {
         'train_epoch_loss': [],
         'epochs': [],
+        'RMSE': [],
+        'MAE': []
         }
         
         print(f"\nTraining for {n_epochs} epochs...")
@@ -529,10 +596,6 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
     print(f"\nTraining complete! Duration: {training_time/60:.2f} minutes")
     print(f"Final training loss: {history['train_epoch_loss'][-1]:.4f}")
     
-    # Save model if path provided
-    if model_path:
-        save_checkpoint(model, likelihood, history, model_path, model_type=model_type)
-    
     logger.log_training_end(
         best_epoch=n_epochs,
         best_val_loss=history['train_epoch_loss'][-1],
@@ -549,15 +612,26 @@ def train_h2_dispersion_gp_approximate_additive(df_train,
             means = torch.cat([means, preds.mean.cpu()])
     means = means[1:]
 
-    # Convert to original scale for MAE/RMSE
-    pred_mean_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(means.numpy().reshape(-1, 1)))) - LOG_EPSILON
-    y_val_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(y_val_t.cpu().numpy().reshape(-1, 1)))) - LOG_EPSILON
-    
-    # Ensure non-negative for MAE/RMSE calculation
-    pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
-    
-    mae = torch.mean(torch.abs(pred_mean_orig - y_val_orig)).item()
-    rmse = torch.sqrt(torch.mean((pred_mean_orig - y_val_orig) ** 2)).item()
+    if likelihood_type == "gaussian":
+        # Convert to original scale for MAE/RMSE
+        pred_mean_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(means.numpy().reshape(-1, 1)))) - LOG_EPSILON
+        y_val_orig = torch.exp(torch.from_numpy(y_scaler.inverse_transform(y_val_t.cpu().numpy().reshape(-1, 1)))) - LOG_EPSILON
+        
+        # Ensure non-negative for MAE/RMSE calculation
+        pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
+        
+        mae = torch.mean(torch.abs(pred_mean_orig - y_val_orig)).item()
+        rmse = torch.sqrt(torch.mean((pred_mean_orig - y_val_orig) ** 2)).item()
+    else:
+        mae = torch.mean(torch.abs(means - y_val_t.cpu()))
+        rmse = torch.sqrt(torch.mean(means - y_val_t.cpu()))
+
+
+    history['RMSE'].append(rmse)
+    history['MAE'].append(mae)
+    # Save model if path provided
+    if model_path:
+        save_checkpoint(model, likelihood, history, model_path, model_type=model_type)
 
     plt.figure(figsize=(7, 5))
     plt.plot(history['epochs'], history['train_epoch_loss'], label='Train Epoch Loss', marker='s', markersize=4)
@@ -598,8 +672,7 @@ def save_checkpoint(model, likelihood, history, path, model_type='gp'):
         'likelihood_state_dict': likelihood.state_dict(),
         'history': history,
         'epoch': history['epochs'],
-        'model_type': model_type,
-        'log_epsilon': LOG_EPSILON,
+        'model_type': model_type
     }
     
     torch.save(checkpoint, path)
@@ -608,8 +681,23 @@ def save_checkpoint(model, likelihood, history, path, model_type='gp'):
     # Also save history as JSON
     history_path = path.parent / (path.stem + '_history.json')
     with open(history_path, 'w') as f:
-        history_json = {k: v for k, v in history.items() if v is not None}
-        json.dump(history_json, f, indent=2)
+        # Convert any tensors in history to lists
+        history_serializable = {}
+        for k, v in history.items():
+            if v is None:
+                continue
+            if isinstance(v, list):
+                # Convert each element if it's a tensor
+                history_serializable[k] = [
+                    float(x.item()) if isinstance(x, torch.Tensor) else x 
+                    for x in v
+                ]
+            elif isinstance(v, torch.Tensor):
+                history_serializable[k] = v.detach().cpu().tolist()
+            else:
+                history_serializable[k] = v
+        
+        json.dump(history_serializable, f, indent=2)
     print(f"History saved to {history_path}")
 
 
@@ -981,11 +1069,7 @@ def load_model(checkpoint_path, device='cpu'):
     
     inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points'].to(device)
     
-    model = SparseH2DispersionGP(
-        inducing_points=inducing_points,
-        learn_inducing=False  # Don't optimize when loading
-    ).double().to(device)
-    
+    model = SparseH2DispersionGP(inducing_points=inducing_points)
     #likelihood = gpytorch.likelihoods.BetaLikelihood().double().to(device)
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
 
@@ -1021,28 +1105,6 @@ if __name__ == "__main__":
         29: (0.47, 4.63, 0.27), 30: (0.46, 4.44, 0.0),
     }
     
-    # Split data - only train and test available
-    df_train_full = df[df['split'] == 'train'].copy()
-    df_test = df[df['split'] == 'test'].copy()
-    
-    print(f"Full train: {len(df_train_full):,} rows, Test: {len(df_test):,} rows")
-    
-    # Split training data into train and validation (80/20 split by scenarios)
-    split_ratio = 0.2
-    train_scenarios = df_train_full['scenario'].unique()
-    n_val = max(1, int(len(train_scenarios) * split_ratio))
-    np.random.seed(42)
-    val_scenarios = np.random.choice(train_scenarios, size=n_val, replace=False)
-    
-    df_train = df_train_full[~df_train_full['scenario'].isin(val_scenarios)].copy()
-    df_val = df_train_full[df_train_full['scenario'].isin(val_scenarios)].copy()
-    
-    print(f"Split train: {len(df_train):,} rows, Val: {len(df_val):,} rows")
-    print(f"Validation scenarios: {list(val_scenarios)}")
-    
-    # Create experiment logger
-    logger = ExperimentLogger(log_dir='experiments')
-    
     # Train on training set only
     print("\nTraining GP model...")
     """model, likelihood, history = train_h2_dispersion_gp(
@@ -1064,13 +1126,16 @@ if __name__ == "__main__":
     )"""
 
     model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
-        df_train=df_train,
+        df=df,
+        split_ratio=0.3,
         n_inducing=6000,
+        k=32,
+        training_batch_size=1024,
         model_type="VNNGP",
-        likelihood_type="gaussian",
-        n_epochs=100,
-        learning_rate=0.01,
+        likelihood_type="beta",
+        n_epochs=1,
+        learning_rate=0.008,
         device='cuda:0',
-        logger=logger,
-        model_path='models/approximate_vnngp_matern32_k256.pth'
+        model_path='models/approximate_scaleAdditive_vnngp_k32_beta.pth',
+        trained_model=None
     )
