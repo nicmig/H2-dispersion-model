@@ -5,10 +5,12 @@
 EXPERIMENT_DIR="experiments"
 LOG_DIR="logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_NAME="${1:-experiment_$TIMESTAMP}"
+MODEL_TYPE="scaleAdditiveVNNGP"
+LIKELIHOOD_TYPE="Beta"
+K="K128"
+EXPERIMENT_NAME="${1:-experiment_${MODEL_TYPE}_${K}_${LIKELIHOOD_TYPE}_$TIMESTAMP}"
 LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
 SUMMARY_FILE="$EXPERIMENT_DIR/${EXPERIMENT_NAME}_summary.txt"
-EMAIL="${2:-}"  # Optional: provide email as second argument
 
 # Create directories
 mkdir -p "$LOG_DIR"
@@ -20,9 +22,6 @@ echo "=============================================="
 echo "Experiment: $EXPERIMENT_NAME"
 echo "Log file: $LOG_FILE"
 echo "Summary will be saved to: $SUMMARY_FILE"
-if [ -n "$EMAIL" ]; then
-    echo "Notification email: $EMAIL"
-fi
 echo "=============================================="
 echo ""
 
@@ -40,7 +39,7 @@ sys.path.insert(0, '/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model')
 # Import your training module
 import torch
 import pandas as pd
-from latent_mass_flow_gp import train_h2_dispersion_gp
+from h2_dispersion_gp import train_h2_dispersion_gp_approximate_additive
 
 # Configuration
 EXPERIMENT_NAME = "EXPERIMENT_NAME_PLACEHOLDER"
@@ -106,12 +105,17 @@ def main():
         
         # Training configuration
         config = {
+            'split_ratio': 0.3,
             'n_inducing': 500,
-            'n_epochs': 200,
+            'k': 32,
+            'training_batch_size': 1024,
+            'n_epochs': 100,
             'learning_rate': 0.01,
-            'early_stopping_patience': 20,
-            'test_size': 0.15,
-            'val_size': 0.15,
+            'model_type': "VNNGP",
+            'likelihood_type': "beta",
+            'device': 'cuda:0',
+            'model_path': 'models/approximate_scaleAdditive_vnngp_k32_beta.pth',
+            'trained_model': None
         }
         
         print("Training configuration:")
@@ -122,16 +126,21 @@ def main():
         # Train model
         print("Starting training...")
         print("-" * 70)
-        
-        model, likelihood, history = train_h2_dispersion_gp(
-            df,
+
+        model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
+            df=df,
+            split_ratio=config['split_ratio'],
             n_inducing=config['n_inducing'],
+            k=config['k'],
+            training_batch_size=config['training_batch_size'],
             n_epochs=config['n_epochs'],
             learning_rate=config['learning_rate'],
-            early_stopping_patience=config['early_stopping_patience'],
-            test_size=config['test_size'],
-            val_size=config['val_size'],
-        )
+            model_type=config['model_type'],
+            likelihood_type=config['likelihood_type'],
+            device=config['device'],
+            model_path=config['model_path'],
+            trained_model=config['trained_model']
+    )
         
         elapsed = time.time() - start_time
         
@@ -140,15 +149,21 @@ def main():
 Training completed successfully!
 
 Configuration:
+  - Split ratio: {config['split_ratio']}
   - Inducing points: {config['n_inducing']}
+  - K: {config['k']}
+  - Training batch size: {config['training_batch_size']}
+  - Model type: {config['model_type']}
+  - Likelihood type: {config['likelihood_type']}
   - Epochs: {config['n_epochs']}
   - Learning rate: {config['learning_rate']}
-  - Early stopping patience: {config['early_stopping_patience']}
+  - Device: {config['device']}
+  - Model path: {config['model_path']}
 
 Training History:
-  - Best epoch: {history.get('best_epoch', 'N/A')}
-  - Best validation loss: {history.get('best_val_loss', 'N/A'):.6f}
-  - Final training loss: {history.get('train_losses', [-1])[-1]:.6f}
+  - MAE: {history.get('MAE', 'N/A'):.4f}
+  - RMSE: {history.get('RMSE', 'N/A'):.6f}
+  - Final training loss: {history['train_epoch_loss'][-1]:.4f}
   - Training duration: {elapsed/60:.2f} minutes
 
 Model saved to: experiments/model_{EXPERIMENT_NAME}.pt
@@ -204,30 +219,10 @@ sed -i "s|LOG_FILE_PLACEHOLDER|$LOG_FILE|g" /tmp/run_training_${TIMESTAMP}.py
 (
     source venv/bin/activate
     
+    export CUDA_VISIBLE_DEVICES=1
     # Run training with unbuffered output
-    python -u /tmp/run_training_${TIMESTAMP}.py 2>&1 | tee "$LOG_FILE"
+    python3 -u /tmp/run_training_${TIMESTAMP}.py 2>&1 | tee "$LOG_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
-    
-    # Send email notification if requested
-    if [ -n "$EMAIL" ] && [ -f "$SUMMARY_FILE" ]; then
-        if command -v mail &> /dev/null; then
-            SUBJECT="H2 Model Training $([ $EXIT_CODE -eq 0 ] && echo 'SUCCESS' || echo 'FAILED') - $EXPERIMENT_NAME"
-            mail -s "$SUBJECT" "$EMAIL" < "$SUMMARY_FILE"
-            echo "Email notification sent to $EMAIL"
-        elif command -v sendmail &> /dev/null; then
-            SUBJECT="H2 Model Training $([ $EXIT_CODE -eq 0 ] && echo 'SUCCESS' || echo 'FAILED') - $EXPERIMENT_NAME"
-            {
-                echo "To: $EMAIL"
-                echo "Subject: $SUBJECT"
-                echo "Content-Type: text/plain; charset=UTF-8"
-                echo ""
-                cat "$SUMMARY_FILE"
-            } | sendmail "$EMAIL"
-            echo "Email notification sent to $EMAIL"
-        else
-            echo "Warning: No mail command found. Email notification not sent."
-        fi
-    fi
     
     # Cleanup temporary script
     rm -f /tmp/run_training_${TIMESTAMP}.py
