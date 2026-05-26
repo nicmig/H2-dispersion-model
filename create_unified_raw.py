@@ -51,9 +51,21 @@ THIRTY_FIVE_SEC_START = ['23_FFI_P101_T00004', '23_FFI_P101_T00007',
                            '23_FFI_P101_T00042', '23_FFI_P101_T00044',
                            '23_FFI_P101_T00045']
 
+# experimental cut-off when experiment is "dead" == leakage stops
+THIRTY_SEC = ['23_FFI_P101_T00005']
+SIXTY_SEC = ['23_FFI_P101_T00003', '23_FFI_P101_T00007', '23_FFI_P101_T00009', '23_FFI_P101_T00006', '23_FFI_P101_T00008']
+NINETY_SEC = ['23_FFI_P101_T00011']
+HUNDRED_TWENTY_SEC = ['23_FFI_P101_T00004', '23_FFI_P101_T00026', '23_FFI_P101_T00027', '23_FFI_P101_T00028', '23_FFI_P101_T00014', '23_FFI_P101_T00012', '23_FFI_P101_T00013', 
+                      '23_FFI_P101_T00029', '23_FFI_P101_T00030', '23_FFI_P101_T00031']
+TWO_HUNDRED_FORTY_SEC = ['23_FFI_P101_T00040', '23_FFI_P101_T00041', '23_FFI_P101_T00042', '23_FFI_P101_T00044', '23_FFI_P101_T00045']
+
 # Splits
 HELD_OUT_TEST_EXPERIMENTS = ['23_FFI_P101_T00005', '23_FFI_P101_T00014', 
                              '23_FFI_P101_T00031', '23_FFI_P101_T00045']
+
+# Threshold for active/inactive sensor classification
+# Values above this threshold are considered "active" (H2 detected)
+ACTIVE_THRESHOLD = 1e-2
 
 SENSOR_POSITIONS = {
     1: (0.77, 0.24, 0.8), 2: (0.46, 0.0, 0.8), 3: (0.48, 0.25, 0.52),
@@ -129,9 +141,9 @@ def process_cfd_scenario(scenario_dir, scenario_name):
         if not df_sensor.empty:
             all_sensor_dfs.append(df_sensor)
     
-    if all_sensor_dfs:
-        return pd.concat(all_sensor_dfs, ignore_index=True)
-    return pd.DataFrame()
+    all_sensor_dfs = pd.concat(all_sensor_dfs, ignore_index=True)
+
+    return all_sensor_dfs
 
 
 def extract_mean_mass_flow(df_exp):
@@ -207,9 +219,6 @@ def process_experiment(exp_file, exp_name):
         parts = sensor_col.split()
         sensor_num = int(parts[1])
         
-        if sensor_num not in SENSOR_POSITIONS:
-            continue
-        
         x, y, z = SENSOR_POSITIONS[sensor_num]
         
         # Experimental data is in volume fraction [%], convert to fraction
@@ -232,10 +241,9 @@ def process_experiment(exp_file, exp_name):
         })
         
         all_records.append(records)
-    
-    if all_records:
-        return pd.concat(all_records, ignore_index=True)
-    return pd.DataFrame()
+    all_records = pd.concat(all_records, ignore_index=True)
+
+    return all_records
 
 
 def shift_time_to_mass_flow_start(df, exp_name):
@@ -249,6 +257,21 @@ def shift_time_to_mass_flow_start(df, exp_name):
         df = df[df['time'] >= 35]
         t_min = df['time'].min()
         df['time'] = df['time'] - t_min
+    return df
+
+def cut_off_time(df, exp_name):
+    """Shift time so that time starts when mass flow starts."""
+    df = df.copy()
+    if exp_name in THIRTY_SEC:
+        df = df[df['time'] <= 30]
+    elif exp_name in SIXTY_SEC:
+        df = df[df['time'] <= 60]
+    elif exp_name in NINETY_SEC:
+        df = df[df['time'] <= 90]
+    elif exp_name in HUNDRED_TWENTY_SEC:
+        df = df[df['time'] <= 120]
+    else:
+        df = df[df['time'] <= 240]
     return df
 
 def assign_split(df, exp_name):
@@ -302,8 +325,9 @@ def main():
         df_exp = process_experiment(exp_file, exp_name)
         if not df_exp.empty:
             df_exp = shift_time_to_mass_flow_start(df_exp, exp_name)
-            # Filter: keep only data up to 240 seconds after mass flow start
-            df_exp = df_exp[df_exp['time'] <= 240]
+            # Filter: keep only data where leakage is still present
+            df_exp = cut_off_time(df_exp,exp_name)
+            #df_exp = df_exp[df_exp['time'] <= 240]
             df_exp['split'] = assign_split(df_exp, exp_name)
             split_name = df_exp['split'].iloc[0]
             all_data.append(df_exp)
@@ -312,8 +336,16 @@ def main():
     logger.info("Combining data...")
     df_all = pd.concat(all_data, ignore_index=True)
     
+    # Add active/inactive label based on H2 volume fraction threshold
+    df_all['active'] = (df_all['h2_volume_fraction'] > ACTIVE_THRESHOLD).astype(int)
+    n_active = df_all['active'].sum()
+    n_inactive = len(df_all) - n_active
+    logger.info(f"Active/inactive label added (threshold={ACTIVE_THRESHOLD})")
+    logger.info(f"  Active:   {n_active:,} ({100*n_active/len(df_all):.1f}%)")
+    logger.info(f"  Inactive: {n_inactive:,} ({100*n_inactive/len(df_all):.1f}%)")
+    
     # Save unified raw data
-    output_file = data_dir / 'unified_raw.csv'
+    output_file = data_dir / 'unified_raw_two_modes.csv'
     df_all.to_csv(output_file, index=False)
     logger.info(f"Saved unified raw data: {output_file} ({len(df_all)} records)")
     
@@ -349,13 +381,15 @@ def main():
     summary_lines.append("\nOverall Statistics:")
     summary_lines.append("-" * 40)
     summary_lines.append(f"Sources: {df_all['source'].value_counts().to_dict()}")
+    summary_lines.append(f"\nActive/Inactive (threshold={ACTIVE_THRESHOLD}):")
+    summary_lines.append(df_all['active'].value_counts().to_string())
     summary_lines.append(f"\nH2 Volume Fraction by source:")
     summary_lines.append(df_all.groupby('source')['h2_volume_fraction'].describe().to_string())
     summary_lines.append(f"\nMass Flow by source:")
     summary_lines.append(df_all.groupby('source')['mass_flow'].describe().to_string())
     
     # Save summary to file
-    summary_file = data_dir / 'unified_raw_summary.txt'
+    summary_file = data_dir / 'unified_raw_summary_two_modes.txt'
     with open(summary_file, 'w') as f:
         f.write('\n'.join(summary_lines))
     logger.info(f"Saved summary statistics: {summary_file}")
