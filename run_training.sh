@@ -6,7 +6,7 @@ EXPERIMENT_DIR="experiments"
 LOG_DIR="logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MODEL_TYPE="scaleAdditiveVNNGP"
-LIKELIHOOD_TYPE="Beta"
+LIKELIHOOD_TYPE="Gaussian"
 K="K128"
 EXPERIMENT_NAME="${1:-experiment_${MODEL_TYPE}_${K}_${LIKELIHOOD_TYPE}_$TIMESTAMP}"
 LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
@@ -97,7 +97,7 @@ def main():
         
         # Load data
         print("Loading data...")
-        df = pd.read_csv('data/unified_raw.csv')
+        df = pd.read_csv('data/unified_raw_two_modes.csv')
         print(f"Loaded {len(df)} rows")
         print(f"Mass flow range: {df['mass_flow'].min():.4f} - {df['mass_flow'].max():.4f}")
         print(f"Time range: {df['time'].min():.1f} - {df['time'].max():.1f}")
@@ -105,17 +105,20 @@ def main():
         
         # Training configuration
         config = {
-            'split_ratio': 0.3,
+            'split_ratio': 0.2,
             'n_inducing': 500,
-            'k': 32,
-            'training_batch_size': 1024,
-            'n_epochs': 100,
+            'k': 128,
+            'training_batch_size': 256,
+            'n_epochs': 300,
             'learning_rate': 0.01,
             'model_type': "VNNGP",
-            'likelihood_type': "beta",
+            'likelihood_type': "gaussian",
             'device': 'cuda:0',
-            'model_path': 'models/approximate_scaleAdditive_vnngp_k32_beta.pth',
-            'trained_model': None
+            'model_path': 'models/approximate_scaleAdditive_vnngp_rbf_k128_gaussian_two_modes.pth',
+            'trained_model': None,
+            'val_every_n_epochs': 10,
+            'early_stopping_patience': 50,
+            'mass_flow_lengthscale_min': 0.1
         }
         
         print("Training configuration:")
@@ -139,7 +142,10 @@ def main():
             likelihood_type=config['likelihood_type'],
             device=config['device'],
             model_path=config['model_path'],
-            trained_model=config['trained_model']
+            trained_model=config['trained_model'],
+            val_every_n_epochs=config['val_every_n_epochs'],
+            early_stopping_patience=config['early_stopping_patience'],
+            mass_flow_lengthscale_min=config['mass_flow_lengthscale_min']
     )
         
         elapsed = time.time() - start_time
@@ -159,10 +165,16 @@ Configuration:
   - Learning rate: {config['learning_rate']}
   - Device: {config['device']}
   - Model path: {config['model_path']}
+  - Val every N epochs: {config['val_every_n_epochs']}
+  - Early stopping patience: {config['early_stopping_patience']}
+  - Mass flow lengthscale min: {config['mass_flow_lengthscale_min']}
 
 Training History:
-  - MAE: {history.get('MAE', 'N/A'):.4f}
-  - RMSE: {history.get('RMSE', 'N/A'):.6f}
+  - Final MAE: {history['MAE'][-1] if history.get('MAE') else 'N/A'}
+  - Final RMSE: {history['RMSE'][-1] if history.get('RMSE') else 'N/A'}
+  - Best validation MAE: {min(history['val_MAE']) if history.get('val_MAE') else 'N/A'}
+  - Best validation RMSE: {min(history['val_RMSE']) if history.get('val_RMSE') else 'N/A'}
+  - Best epoch: {history.get('best_epoch', 'N/A')}
   - Final training loss: {history['train_epoch_loss'][-1]:.4f}
   - Training duration: {elapsed/60:.2f} minutes
 
@@ -219,7 +231,7 @@ sed -i "s|LOG_FILE_PLACEHOLDER|$LOG_FILE|g" /tmp/run_training_${TIMESTAMP}.py
 (
     source venv/bin/activate
     
-    export CUDA_VISIBLE_DEVICES=1
+    export CUDA_VISIBLE_DEVICES=0
     # Run training with unbuffered output
     python3 -u /tmp/run_training_${TIMESTAMP}.py 2>&1 | tee "$LOG_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
