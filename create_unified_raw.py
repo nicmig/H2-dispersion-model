@@ -65,7 +65,7 @@ HELD_OUT_TEST_EXPERIMENTS = ['23_FFI_P101_T00005', '23_FFI_P101_T00014',
 
 # Threshold for active/inactive sensor classification
 # Values above this threshold are considered "active" (H2 detected)
-ACTIVE_THRESHOLD = 1e-2
+ACTIVE_THRESHOLD = 0.009
 
 SENSOR_POSITIONS = {
     1: (0.77, 0.24, 0.8), 2: (0.46, 0.0, 0.8), 3: (0.48, 0.25, 0.52),
