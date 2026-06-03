@@ -37,6 +37,9 @@ from torch.utils.data import TensorDataset, DataLoader
 # Import additive kernels
 from additive_kernels import ScaleAdditiveKernel, FullAdditiveKernel
 
+# Epsilon for log-transform to avoid log(0)
+LOG_EPSILON = 1e-4
+
 
 class ExperimentLogger:
     """Logger for tracking experiment runs and their key information."""
@@ -172,10 +175,10 @@ class VNNGP(gpytorch.models.ApproximateGP):
 
         variational_distribution = gpytorch.variational.MeanFieldVariationalDistribution(m)
 
-        variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.001)
+        variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.0001)
 
         super(VNNGP, self).__init__(variational_strategy)
-        self.mean_module = gpytorch.means.ZeroMean()
+        self.mean_module = gpytorch.means.ConstantMean()
         #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
         self.covar_module = ScaleAdditiveKernel(
             base_kernel_type='rbf', num_dims=5,
@@ -267,7 +270,7 @@ def train_h2_dispersion_gp(df_train,
     x_scaler.fit(X)
     X_scaled = x_scaler.transform(X)
     
-    y_log = np.log(y)
+    y_log = np.log(y + LOG_EPSILON)
     
     X_train = torch.tensor(X_scaled, dtype=torch.float64, device=device)
     y_train = torch.tensor(y_log, dtype=torch.float64, device=device)
@@ -376,6 +379,9 @@ def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
         for x_batch, y_batch in val_loader:
             preds = model(x_batch)
             means = torch.cat([means, preds.mean.cpu()])
+            # Free GPU memory after each batch to prevent OOM with large k
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     means = means[1:]
 
     if likelihood_type == "gaussian":
@@ -510,7 +516,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         x_scaler.fit(X)
         x_scaled = x_scaler.transform(X)
         y = df_train['h2_volume_fraction'].values
-        y_log = np.log(y)
+        y_log = np.log(y + LOG_EPSILON)
         y_scaler.fit(y_log.reshape(-1,1))
         y_scaled = y_scaler.transform(y_log.reshape(-1,1))
 
@@ -524,14 +530,14 @@ def train_h2_dispersion_gp_approximate_additive(df,
         X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
         x_val_scaled = x_scaler.transform(X_val)
         y_val = df_val['h2_volume_fraction'].values
-        y_val_log = np.log(y_val)
+        y_val_log = np.log(y_val + LOG_EPSILON)
         y_val_scaled = y_scaler.transform(y_val_log.reshape(-1,1))
 
         X_val_t = torch.tensor(x_val_scaled, dtype=torch.float64, device=device).contiguous()
         y_val_t = torch.tensor(y_val_scaled, dtype=torch.float64, device=device).contiguous()
 
         val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
-        val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
         print(f"Input dimensions: time, mass_flow, x,  y, z")
@@ -560,7 +566,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         y_val_t = torch.tensor(y_val, dtype=torch.float64, device=device).contiguous()
 
         val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
-        val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
         print(f"Input dimensions: time, mass_flow, x, y, z")
@@ -926,7 +932,7 @@ def save_checkpoint(model, likelihood, history, path, model_type='gp',
     print(f"History saved to {history_path}")
 
 
-def evaluate_gp_model(model, likelihood, df_test, device='cpu'):
+def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y_scaler=None):
     """
     Evaluate trained GP model on test set.
     
@@ -938,6 +944,8 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu'):
         likelihood: Model likelihood
         df_test: Test dataframe
         device: 'cpu' or 'cuda'
+        x_scaler: StandardScaler for input features (if used during training)
+        y_scaler: StandardScaler for log-targets (if used during training)
     
     Returns:
         metrics: Dict with 'mae', 'rmse', 'r2', 'nll', 'predictions', 'targets'
@@ -949,7 +957,11 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu'):
     # Prepare test data
     X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
     y_test = df_test['h2_volume_fraction'].values
-    y_test_log = np.log(y_test)
+    y_test_log = np.log(y_test + LOG_EPSILON)
+    
+    # Apply input scaling if scaler was used during training
+    if x_scaler is not None:
+        X_test = x_scaler.transform(X_test)
     
     X_test_t = torch.tensor(X_test, dtype=torch.float64, device=device)
     y_test_t = torch.tensor(y_test_log, dtype=torch.float64, device=device)
@@ -970,9 +982,18 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu'):
         nll = -mll(pred, y_test_t)
         
         # Convert to original scale for metrics
-        pred_mean_orig = torch.exp(pred_mean)
-        y_test_orig = torch.exp(y_test_t)
-        pred_std_orig = pred_std * torch.exp(pred_mean)  # Approximate std in original space
+        if y_scaler is not None:
+            pred_mean_orig = torch.exp(torch.from_numpy(
+                y_scaler.inverse_transform(pred_mean.cpu().numpy().reshape(-1, 1))
+            ).to(device))
+            y_test_orig = torch.exp(torch.from_numpy(
+                y_scaler.inverse_transform(y_test_t.cpu().numpy().reshape(-1, 1))
+            ).to(device))
+        else:
+            pred_mean_orig = torch.exp(pred_mean)
+            y_test_orig = torch.exp(y_test_t)
+        
+        pred_std_orig = pred_std * pred_mean_orig  # Delta method: std in original space ≈ std_log * mean_orig
         
         # Ensure non-negative
         pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
