@@ -177,20 +177,41 @@ class ScaleAdditiveKernel(Kernel):
         base_kernel_type: str,
         num_dims: int,
         lengthscale_prior=None,
+        lengthscale_constraints=None,
         **kwargs
     ):
         super().__init__(**kwargs)
         
         self.num_dims = num_dims
         base_kernels = []
+        
+        # lengthscale_constraints: list of constraints, one per dimension
+        if lengthscale_constraints is None:
+            lengthscale_constraints = [None] * num_dims
     
         for i in range(num_dims):
+            lc = lengthscale_constraints[i] if i < len(lengthscale_constraints) else None
             if base_kernel_type.lower() == 'rbf':
-                k = gpytorch.kernels.keops.RBFKernel(ard_num_dims=1, active_dims=[i], lengthscale_prior=lengthscale_prior, **kwargs)
+                k = gpytorch.kernels.keops.RBFKernel(
+                    ard_num_dims=1, active_dims=[i],
+                    lengthscale_prior=lengthscale_prior,
+                    lengthscale_constraint=lc,
+                    **kwargs
+                )
             elif base_kernel_type.lower() == 'matern32':
-                k = gpytorch.kernels.keops.MaternKernel(nu=1.5, active_dims=[i])
+                k = gpytorch.kernels.keops.MaternKernel(
+                    nu=1.5, active_dims=[i],
+                    lengthscale_prior=lengthscale_prior,
+                    lengthscale_constraint=lc,
+                    **kwargs
+                )
             elif base_kernel_type.lower() == 'matern52':
-                k = gpytorch.kernels.keops.MaternKernel(nu=2.5, active_dims=[i])
+                k = gpytorch.kernels.keops.MaternKernel(
+                    nu=2.5, active_dims=[i],
+                    lengthscale_prior=lengthscale_prior,
+                    lengthscale_constraint=lc,
+                    **kwargs
+                )
             else:
                 raise ValueError(f"Unknown kernel type: {base_kernel_type}")
             
