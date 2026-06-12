@@ -144,22 +144,38 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         self.mean_module = gpytorch.means.ConstantMean()
         
         # additive kernel
-        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
+        """self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
         self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
         self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
-        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))"""
+
+        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,2)))
+        self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,3)))
+        self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,4)))
+        self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(2,3)))
+        self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(2,4)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(3,4)))
         # 3d kernels
-        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
+        """self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
         self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
         self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,3,4)))
-        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))"""
+
+        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,2,3)))
+        self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,2,4)))
+        self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
-        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
+        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=4, active_dims=(1,2,3,4)))
+        
+        #self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
 
         # 5d kernel
-        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=5, active_dims=(0,1,2,3,4)))
+        
+        #self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
 
 
         self.constant = gpytorch.kernels.ConstantKernel()
@@ -1112,6 +1128,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     
     # Determine likelihood type
     is_beta = isinstance(likelihood, gpytorch.likelihoods.BetaLikelihood)
+    is_vnngp = isinstance(model, VNNGP)
     
     # Prepare test data
     X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
@@ -1129,16 +1146,19 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     else:
         # Gaussian likelihood: target in log space
         y_test_log = np.log(y_test + LOG_EPSILON)
-        y_test_t = torch.tensor(y_test_log, dtype=torch.float64, device=device).contiguous()
+        y_scaled = y_scaler.transform(y_test_log.reshape(-1,1))
+        y_test_t = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
     
     print(f"Test data: {len(X_test_t):,} points")
-    
+
     model.eval()
     likelihood.eval()
-    
+
     with torch.no_grad():
         # Get predictions
         pred = likelihood(model(X_test_t))
+        log_lik = likelihood.log_marginal(y_test_t.squeeze(), model(X_test_t))
+        nll = -log_lik.mean().item()
         pred_mean = pred.mean
         pred_std = pred.stddev
         # Non-Gaussian likelihoods (e.g., Beta) return (num_mc_samples, N).
@@ -1152,13 +1172,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
             pred_std = torch.sqrt(pred_var_within + pred_var_between)
         pred_mean = pred_mean.view(-1)
         pred_std = pred_std.view(-1)
-        
-        # Compute NLL
-        if is_beta:
-            nll = -pred.log_prob(y_test_t).mean()
-        else:
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-            nll = -mll(pred, y_test_t)
+       
         
         # Convert to original scale for metrics
         if is_beta:
@@ -1189,7 +1203,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     metrics = {
         'mae': mae,
         'rmse': rmse,
-        'nll': nll.item(),
+        'nll': nll,
         'predictions': pred_mean_orig.cpu().numpy(),
         'targets': y_test_orig.cpu().numpy(),
         'std': pred_std_orig.cpu().numpy(),
@@ -1267,10 +1281,16 @@ def load_model(checkpoint_path, device='cpu'):
     model_type = checkpoint.get('model_type', 'SVGP')
     hyperparams = checkpoint.get('hyperparams', {})
     
+    # Likelihood type
+    likelihood_type = hyperparams.get('likelihood_type', 'gaussian')
+    if likelihood_type == 'beta':
+        likelihood = gpytorch.likelihoods.BetaLikelihood().double().to(device)
+    else:
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
+    
     if model_type == 'VNNGP' or model_type.endswith('vnngp'):
         # VNNGP reconstruction
         inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points'].to(device)
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
         
         # Read hyperparameters from checkpoint, with sensible defaults
         k = hyperparams.get('k', 64)
@@ -1295,7 +1315,6 @@ def load_model(checkpoint_path, device='cpu'):
         # Default: SparseH2DispersionGP (SVGP)
         inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points'].to(device)
         model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
