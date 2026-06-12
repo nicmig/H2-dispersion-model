@@ -60,8 +60,8 @@ HUNDRED_TWENTY_SEC = ['23_FFI_P101_T00004', '23_FFI_P101_T00026', '23_FFI_P101_T
 TWO_HUNDRED_FORTY_SEC = ['23_FFI_P101_T00040', '23_FFI_P101_T00041', '23_FFI_P101_T00042', '23_FFI_P101_T00044', '23_FFI_P101_T00045']
 
 # Splits
-HELD_OUT_TEST_EXPERIMENTS = ['23_FFI_P101_T00005', '23_FFI_P101_T00014', 
-                             '23_FFI_P101_T00031', '23_FFI_P101_T00045']
+HELD_OUT_TEST_EXPERIMENTS = ['23_FFI_P101_T00006', '23_FFI_P101_T00011', 
+                             '23_FFI_P101_T00045', '23_FFI_P101_T00040']
 
 # Threshold for active/inactive sensor classification
 # Values above this threshold are considered "active" (H2 detected)
