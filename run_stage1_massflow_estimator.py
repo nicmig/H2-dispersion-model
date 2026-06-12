@@ -253,48 +253,48 @@ def loeo_cv_torch(
 # ---------------------------------------------------------------------------
 
 def plot_results(results_mlp: Dict, save_path: Path):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig, axes = plt.subplots(1, 3, figsize=(14, 6))
 
     axmin, axmax = 0, max(results_mlp["y_true"].max(), results_mlp["y_pred"].max()) * 1.1
 
     # Panel 1: Scatter predicted vs true
-    ax = axes[0, 0]
+    ax = axes[0]
     ax.scatter(results_mlp["y_true"], results_mlp["y_pred"], alpha=0.4, s=15, c="green", label=f"MLP (MAE={results_mlp['overall']['MAE']:.3f})")
     ax.plot([axmin, axmax], [axmin, axmax], "k--", lw=2)
-    ax.set_xlabel("True Mass Flow (kg/s)")
-    ax.set_ylabel("Predicted Mass Flow (kg/s)")
+    ax.set_xlabel("True Mass Flow (g/s)")
+    ax.set_ylabel("Predicted Mass Flow (g/s)")
     ax.set_title("MLP: Predicted vs True Mass Flow")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     # Panel 2: Per-experiment MAE
-    ax = axes[0, 1]
+    ax = axes[1]
     exp_names = [f["holdout"] for f in results_mlp["folds"]]
     mlp_maes = [f["MAE"] for f in results_mlp["folds"]]
 
     x = np.arange(len(exp_names))
     ax.bar(x, mlp_maes, color="green", alpha=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(exp_names, rotation=45, ha="right", fontsize=7)
-    ax.set_ylabel("MAE (kg/s)")
+    ax.set_xticklabels(exp_names, rotation=45, ha="right", fontsize=5)
+    ax.set_ylabel("MAE (g/s)")
     ax.set_title("Per-Experiment MAE")
     ax.grid(True, alpha=0.3, axis="y")
 
     # Panel 3: MLP scatter zoomed
-    ax = axes[1, 0]
+    """ax = axes[1, 0]
     ax.scatter(results_mlp["y_true"], results_mlp["y_pred"], alpha=0.4, s=15, c="green")
     ax.plot([axmin, axmax], [axmin, axmax], "k--", lw=2)
     ax.set_xlabel("True Mass Flow (kg/s)")
     ax.set_ylabel("Predicted Mass Flow (kg/s)")
     ax.set_title(f"MLP: MAE={results_mlp['overall']['MAE']:.4f}, RMSE={results_mlp['overall']['RMSE']:.4f}, MAPE={results_mlp['overall']['MAPE']:.1f}%")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3)"""
 
     # Panel 4: Error distribution
-    ax = axes[1, 1]
+    ax = axes[2]
     mlp_err = results_mlp["y_pred"] - results_mlp["y_true"]
     ax.hist(mlp_err, bins=30, alpha=0.7, color="green", label=f"MLP (μ={np.mean(mlp_err):.3f})")
     ax.axvline(0, color="black", linestyle="--")
-    ax.set_xlabel("Prediction Error (kg/s)")
+    ax.set_xlabel("Prediction Error (g/s)")
     ax.set_ylabel("Count")
     ax.set_title("Error Distribution")
     ax.legend()
@@ -332,7 +332,7 @@ def main():
     # Improved MLP on combined features
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("MLP (log-sensors + handcrafted features, balanced, ensemble=3, MAE loss)")
+    print("MLP (log-sensors + handcrafted features, balanced, ensemble=7, MAE loss)")
     print("=" * 60)
     results_mlp = loeo_cv_torch(
         X_combined, y, exp_ids,
