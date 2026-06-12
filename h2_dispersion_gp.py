@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
 
 from gpytorch.distributions import MultivariateNormal
 import torch
+torch.cuda.empty_cache()
 import gpytorch
 from gpytorch.variational.nearest_neighbor_variational_strategy import NNVariationalStrategy
 from gpytorch.constraints import Interval
@@ -121,7 +122,7 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
     GP model: f(time, mass_flow, y, z) -> h2_concentration
     """
     
-    def __init__(self, inducing_points):
+    def __init__(self, inducing_points,lengthscale_constraints=None):
         """
         Args:
             inducing_points: Initial inducing point locations [n_inducing, n_features]
@@ -143,7 +144,27 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         self.mean_module = gpytorch.means.ConstantMean()
         
         # additive kernel
-        self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
+        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
+        self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
+        self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
+        self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
+        self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        # 3d kernels
+        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
+        self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
+        self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
+        # 4d kernel
+        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
+
+        # 5d kernel
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+
+
+        self.constant = gpytorch.kernels.ConstantKernel()
+        
+        self.covar_module = self.mass_x + self.mass_y + self.mass_z + self.x_y + self.x_z + self.y_z + self.mass_x_y + self.mass_x_z + self.mass_y_z + self.x_y_z + self.mass_x_y_z + self.all + self.constant
     
     def forward(self, x):
         mean = self.mean_module(x)
@@ -156,8 +177,23 @@ class ExactGPModel(gpytorch.models.ExactGP):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
 
-        #self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[0])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[1])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[2])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[3]))
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[0]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[1])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[0]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[2])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[0]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[3])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[1]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[2])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[1]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[3])) + gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[2]))*gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(active_dims=[3]))
+        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
+        self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
+        self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
+        self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
+        self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        # 3d kernels
+        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
+        self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
+        self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=3, active_dims=(1,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
+        # 4d kernel
+        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
+        # 5d kernel
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+        # sum
+        self.covar_module = self.mass_x + self.mass_y + self.mass_z + self.x_y + self.x_z + self.y_z + self.mass_x_y + self.mass_x_z + self.mass_y_z + self.x_y_z + self.mass_x_y_z + self.all
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -178,12 +214,31 @@ class VNNGP(gpytorch.models.ApproximateGP):
         variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.0001)
 
         super(VNNGP, self).__init__(variational_strategy)
-        self.mean_module = gpytorch.means.ConstantMean()
+        self.mean_module = gpytorch.means.ZeroMean()
         #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
-        self.covar_module = ScaleAdditiveKernel(
-            base_kernel_type='rbf', num_dims=5,
-            lengthscale_constraints=lengthscale_constraints
-        ) # less output scale parameters and more interpretable
+        #self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
+        # 2d kernels
+        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
+        self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
+        self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
+        self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
+        self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        # 3d kernels
+        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
+        self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
+        self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
+        # 4d kernel
+        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
+
+        # 5d kernel
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+
+
+        self.constant = gpytorch.kernels.ConstantKernel()
+        
+        self.covar_module = self.mass_x + self.mass_y + self.mass_z + self.x_y + self.x_z + self.y_z + self.mass_x_y + self.mass_x_z + self.mass_y_z + self.x_y_z + self.mass_x_y_z + self.all + self.constant
 
         self.likelihood = likelihood
     def forward(self, x: torch.Tensor):
@@ -238,7 +293,8 @@ def select_inducing_points(X_train, n_inducing=1000, method='kmeans'):
     return inducing_points
 
 
-def train_h2_dispersion_gp(df_train,
+def train_h2_dispersion_gp(df,
+                           split_ratio=0.2,
                            n_epochs: int = 200,
                            learning_rate: float = 0.005,
                            device: str = 'cpu',
@@ -261,21 +317,44 @@ def train_h2_dispersion_gp(df_train,
     Returns:
         model, likelihood, history: Trained model, likelihood, and training history
     """
+    # Split data - only train and test available
+    df_train_full = df[df['split'] == 'train'].copy()
+    #df_test = df[df['split'] == 'test'].copy()
+    
+    # Filter to active sensors only (two-stage model: classifier handles inactive)
+    if 'active' in df_train_full.columns:
+        n_before = len(df_train_full)
+        df_train_full = df_train_full[df_train_full['active'] == 1].copy()
+        print(f"Filtered to active sensors: {n_before:,} -> {len(df_train_full):,} rows")
+    
+    print(f"Full train: {len(df_train_full):,} rows")
+    
+    # Stratified split by mass flow
+    _, val_scenarios = stratified_scenario_split(df_train_full, split_ratio=split_ratio)
+    
+    df_train = df_train_full[~df_train_full['scenario'].isin(val_scenarios)].copy()
+    df_val = df_train_full[df_train_full['scenario'].isin(val_scenarios)].copy()
+
     # Prepare training data
-    X = df_train[['time', 'mass_flow', 'y', 'z']].values
+    X = df_train[['time', 'mass_flow','x', 'y', 'z']].values
     y = df_train['h2_volume_fraction'].values
     
     # Scale inputs and log-transform target
     x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
     x_scaler.fit(X)
-    X_scaled = x_scaler.transform(X)
-    
+    x_scaled = x_scaler.transform(X)
+    y = df_train['h2_volume_fraction'].values
     y_log = np.log(y + LOG_EPSILON)
+    y_scaler.fit(y_log.reshape(-1,1))
+    y_scaled = y_scaler.transform(y_log.reshape(-1,1))
+
+    x_train = torch.tensor(x_scaled, dtype=torch.float64, device=device).contiguous()
+    y_train = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
+
     
-    X_train = torch.tensor(X_scaled, dtype=torch.float64, device=device)
-    y_train = torch.tensor(y_log, dtype=torch.float64, device=device)
-    
-    print(f"Training data: {len(X_train):,} points")
+    print(f"Training data: {len(x_train):,} points")
     print(f"Input dimensions: time, mass_flow, y, z")
     print(f"Target: log(y)")
     
@@ -284,7 +363,7 @@ def train_h2_dispersion_gp(df_train,
         logger = ExperimentLogger()
     
     logger.log_training_start({
-        'n_train': len(X_train),
+        'n_train': len(x_train),
         'n_epochs': n_epochs,
         'learning_rate': learning_rate,
         'device': device,
@@ -293,7 +372,7 @@ def train_h2_dispersion_gp(df_train,
     
     # Create model
     likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
-    model = ExactGPModel(X_train, y_train, likelihood).to(device)
+    model = ExactGPModel(x_train, y_train, likelihood).to(device)
     
     print(f"\nModel: {type(model).__name__}")
     
@@ -302,7 +381,7 @@ def train_h2_dispersion_gp(df_train,
     likelihood.train()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
     
     history = {
         'train_loss': [],
@@ -310,7 +389,7 @@ def train_h2_dispersion_gp(df_train,
     }
     
     # Data validation
-    assert torch.isfinite(X_train).all(), "NaN/Inf in training features"
+    assert torch.isfinite(x_train).all(), "NaN/Inf in training features"
     assert torch.isfinite(y_train).all(), "NaN/Inf in training targets"
     
     print(f"\nTraining for {n_epochs} epochs...")
@@ -322,7 +401,7 @@ def train_h2_dispersion_gp(df_train,
         iterator = tqdm(range(n_epochs), desc="Training")
         for epoch in iterator:
             optimizer.zero_grad()
-            output = model(X_train)
+            output = model(x_train)
             loss = -mll(output, y_train)
             
             iterator.set_postfix(loss=f"{loss.item():.4f}")
@@ -377,8 +456,13 @@ def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
     means = torch.tensor([0.])
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
-            preds = model(x_batch)
-            means = torch.cat([means, preds.mean.cpu()])
+            preds = likelihood(model(x_batch))
+            pred_mean = preds.mean.cpu()
+            # Non-Gaussian likelihoods (e.g., Beta) use MC sampling and return
+            # mean of shape (num_mc_samples, batch_size). Average over samples.
+            if pred_mean.dim() == 2:
+                pred_mean = pred_mean.mean(dim=0)
+            means = torch.cat([means, pred_mean.view(-1)])
             # Free GPU memory after each batch to prevent OOM with large k
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -395,8 +479,8 @@ def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
         mae = torch.mean(torch.abs(pred_mean_orig - y_val_orig)).item()
         rmse = torch.sqrt(torch.mean((pred_mean_orig - y_val_orig) ** 2)).item()
     else:
-        mae = torch.mean(torch.abs(means - y_val_t.cpu())).item()
-        rmse = torch.sqrt(torch.mean((means - y_val_t.cpu()) ** 2)).item()
+        mae = torch.mean(torch.abs(means - y_val_t.cpu().view(-1))).item()
+        rmse = torch.sqrt(torch.mean((means - y_val_t.cpu().view(-1)) ** 2)).item()
     
     model.train()
     likelihood.train()
@@ -524,7 +608,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         y_train = torch.tensor(y_scaled, dtype=torch.float64, device=device).contiguous()
 
         train_dataset = TensorDataset(x_train, y_train.squeeze())
-        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
         X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
@@ -540,7 +624,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
-        print(f"Input dimensions: time, mass_flow, x,  y, z")
+        print(f"Input dimensions: mass_flow, x,  y, z")
         print(f"Target: log(y)")
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
@@ -555,7 +639,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         y_train = torch.tensor(y, dtype=torch.float64, device=device).contiguous()
 
         train_dataset = TensorDataset(x_train, y_train.squeeze())
-        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
         X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
@@ -607,11 +691,22 @@ def train_h2_dispersion_gp_approximate_additive(df,
             'train_epoch_loss': [],
             'epochs': [],
             'RMSE': [],
-            'MAE': []
+            'MAE': [],
+            'val_RMSE': [],
+            'val_MAE': [],
+            'val_epochs': [],
+            'best_epoch': None
         }
         
         print(f"\nTraining for {n_epochs} epochs...")
+        print(f"Validation every {val_every_n_epochs} epochs, early stopping patience={early_stopping_patience}")
         print("-" * 60)
+        
+        best_val_rmse = float('inf')
+        epochs_since_improvement = 0
+        best_model_state = None
+        best_likelihood_state = None
+        best_optimizer_state = None
         
         start_time = time_module.time()
         
@@ -623,7 +718,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                 for x_batch, y_batch in minibatch_iter:
                     optimizer.zero_grad()
                     output = model(x_batch)
-                    loss = -mll(output, y_batch)
+                    loss = -mll(output, y_batch.squeeze())
                     loss_train = loss.detach().item()
                     minibatch_iter.set_postfix(loss=loss_train)
                     loss_epoch += loss_train
@@ -634,6 +729,59 @@ def train_h2_dispersion_gp_approximate_additive(df,
             iterator.set_postfix(epoch_loss=f"{epoch_loss:.4f}")
             history['train_epoch_loss'].append(epoch_loss)
             history['epochs'].append(epoch)
+            
+            # Validation evaluation every N epochs
+            if (epoch + 1) % val_every_n_epochs == 0:
+                mae, rmse = evaluate_validation(
+                    model, likelihood, val_loader, y_val_t,
+                    y_scaler=y_scaler if likelihood_type == 'gaussian' else None,
+                    likelihood_type=likelihood_type
+                )
+                history['val_MAE'].append(mae)
+                history['val_RMSE'].append(rmse)
+                history['val_epochs'].append(epoch)
+                
+                iterator.set_postfix(
+                    epoch_loss=f"{epoch_loss:.4f}",
+                    val_rmse=f"{rmse:.4f}",
+                    val_mae=f"{mae:.4f}"
+                )
+                print(f"\nEpoch {epoch+1}: Val MAE={mae:.4f}, Val RMSE={rmse:.4f}")
+                
+                # Early stopping check
+                if rmse < best_val_rmse:
+                    best_val_rmse = rmse
+                    epochs_since_improvement = 0
+                    history['best_epoch'] = epoch + 1
+                    # Save best model state
+                    best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    best_likelihood_state = {k: v.cpu().clone() for k, v in likelihood.state_dict().items()}
+                    best_optimizer_state = optimizer.state_dict()
+                    if model_path is not None:
+                        best_path = model_path + "_best"
+                        save_checkpoint(
+                            model, likelihood, history, best_path, model_type=model_type,
+                            x_scaler=x_scaler, y_scaler=y_scaler if likelihood_type == 'gaussian' else None,
+                            hyperparams={
+                                'k': k,
+                                'training_batch_size': training_batch_size,
+                                'n_inducing': n_inducing,
+                                'likelihood_type': likelihood_type,
+                                'lengthscale_constraints': None
+                            }
+                        )
+                else:
+                    epochs_since_improvement += val_every_n_epochs
+                
+                logger.log_epoch(epoch, epoch_loss, val_loss=rmse)
+                
+                if epochs_since_improvement >= early_stopping_patience:
+                    print(f"\nEarly stopping triggered! No improvement for {epochs_since_improvement} epochs.")
+                    print(f"Best validation RMSE: {best_val_rmse:.4f} at epoch {history['best_epoch']}")
+                    break
+            else:
+                logger.log_epoch(epoch, epoch_loss)
+            
             if model_path is not None:
                 path = model_path + str(epoch)
                 save_checkpoint(
@@ -649,8 +797,15 @@ def train_h2_dispersion_gp_approximate_additive(df,
                 )
         
         training_time = time_module.time() - start_time
+        
+        # Restore best model if available
+        if best_model_state is not None:
+            print(f"\nRestoring best model from epoch {history['best_epoch']} (val RMSE={best_val_rmse:.4f})")
+            model.load_state_dict(best_model_state)
+            likelihood.load_state_dict(best_likelihood_state)
+            optimizer.load_state_dict(best_optimizer_state)
 
-    if model_type == "VNNGP":
+    elif model_type == "VNNGP":
         k = k
         training_batch_size = training_batch_size
         y_train = y_train.squeeze()
@@ -679,6 +834,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
             model.load_state_dict(checkpoint['model_state_dict'])
             likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
         else:
+            torch.cuda.set_device(device)
             model = VNNGP(
                 inducing_points=x_train, likelihood=likelihood,
                 k=k, training_batch_size=training_batch_size,
@@ -726,7 +882,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                     output = model(x=None)
                     current_training_indices = model.variational_strategy.current_training_indices
                     y_batch = y_train[..., current_training_indices]
-                    loss = -mll(output, y_batch)
+                    loss = -mll(output, y_batch.squeeze())
                     loss_train = loss.detach().item()
                     minibatch_iter.set_postfix(loss=loss_train)
                     loss_epoch += loss_train
@@ -954,17 +1110,26 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     print("TEST EVALUATION")
     print("=" * 60)
     
+    # Determine likelihood type
+    is_beta = isinstance(likelihood, gpytorch.likelihoods.BetaLikelihood)
+    
     # Prepare test data
     X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
     y_test = df_test['h2_volume_fraction'].values
-    y_test_log = np.log(y_test + LOG_EPSILON)
     
     # Apply input scaling if scaler was used during training
     if x_scaler is not None:
         X_test = x_scaler.transform(X_test)
     
-    X_test_t = torch.tensor(X_test, dtype=torch.float64, device=device)
-    y_test_t = torch.tensor(y_test_log, dtype=torch.float64, device=device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float64, device=device).contiguous()
+    
+    if is_beta:
+        # Beta likelihood: target in raw [0, 1] space
+        y_test_t = torch.tensor(y_test, dtype=torch.float64, device=device).contiguous()
+    else:
+        # Gaussian likelihood: target in log space
+        y_test_log = np.log(y_test + LOG_EPSILON)
+        y_test_t = torch.tensor(y_test_log, dtype=torch.float64, device=device).contiguous()
     
     print(f"Test data: {len(X_test_t):,} points")
     
@@ -976,24 +1141,42 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
         pred = likelihood(model(X_test_t))
         pred_mean = pred.mean
         pred_std = pred.stddev
+        # Non-Gaussian likelihoods (e.g., Beta) return (num_mc_samples, N).
+        # Average over MC samples to get the predictive mean and std.
+        if pred_mean.dim() == 2:
+            # Total variance: E[Var[y|f]] + Var[E[y|f]]
+            pred_sample_means = pred_mean  # (num_mc_samples, N)
+            pred_mean = pred_sample_means.mean(dim=0)
+            pred_var_within = (pred_std ** 2).mean(dim=0)
+            pred_var_between = ((pred_sample_means - pred_mean.unsqueeze(0)) ** 2).mean(dim=0)
+            pred_std = torch.sqrt(pred_var_within + pred_var_between)
+        pred_mean = pred_mean.view(-1)
+        pred_std = pred_std.view(-1)
         
-        # Compute NLL (in log space)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-        nll = -mll(pred, y_test_t)
+        # Compute NLL
+        if is_beta:
+            nll = -pred.log_prob(y_test_t).mean()
+        else:
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+            nll = -mll(pred, y_test_t)
         
         # Convert to original scale for metrics
-        if y_scaler is not None:
-            pred_mean_orig = torch.exp(torch.from_numpy(
-                y_scaler.inverse_transform(pred_mean.cpu().numpy().reshape(-1, 1))
-            ).to(device))
-            y_test_orig = torch.exp(torch.from_numpy(
-                y_scaler.inverse_transform(y_test_t.cpu().numpy().reshape(-1, 1))
-            ).to(device))
+        if is_beta:
+            pred_mean_orig = pred_mean  # already in [0, 1]
+            y_test_orig = y_test_t
+            pred_std_orig = pred_std
         else:
-            pred_mean_orig = torch.exp(pred_mean)
-            y_test_orig = torch.exp(y_test_t)
-        
-        pred_std_orig = pred_std * pred_mean_orig  # Delta method: std in original space ≈ std_log * mean_orig
+            if y_scaler is not None:
+                pred_mean_orig = torch.exp(torch.from_numpy(
+                    y_scaler.inverse_transform(pred_mean.cpu().numpy().reshape(-1, 1))
+                ).to(device))
+                y_test_orig = torch.exp(torch.from_numpy(
+                    y_scaler.inverse_transform(y_test_t.cpu().numpy().reshape(-1, 1))
+                ).to(device))
+            else:
+                pred_mean_orig = torch.exp(pred_mean)
+                y_test_orig = torch.exp(y_test_t)
+            pred_std_orig = pred_std * pred_mean_orig  # Delta method: std in original space ≈ std_log * mean_orig
         
         # Ensure non-negative
         pred_mean_orig = torch.clamp(pred_mean_orig, min=0)
@@ -1136,7 +1319,7 @@ def load_model(checkpoint_path, device='cpu'):
 if __name__ == "__main__":
     
     # Load data
-    df = pd.read_csv('/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model/data/unified_raw_cut_off.csv')
+    df = pd.read_csv('/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model/data/unified_raw_two_modes.csv')
     
     # Sensor positions (should match your data)
     SENSOR_POSITIONS = {
@@ -1155,11 +1338,11 @@ if __name__ == "__main__":
     # Train on training set only
     print("\nTraining GP model...")
     """model, likelihood, history = train_h2_dispersion_gp(
-        df_train, 
-        n_epochs=500,
+        df,
+        split_ratio=0.8,
+        n_epochs=5,
         learning_rate=0.1,
-        device='cuda',
-        logger=logger,
+        device='cuda:0',
         model_path='models/exact_gp.pth'
     )"""
 
@@ -1174,15 +1357,15 @@ if __name__ == "__main__":
 
     model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
         df=df,
-        split_ratio=0.3,
+        split_ratio=0.2,
         n_inducing=6000,
-        k=32,
+        k=16,
         training_batch_size=1024,
         model_type="VNNGP",
         likelihood_type="beta",
-        n_epochs=1,
+        n_epochs=300,
         learning_rate=0.008,
         device='cuda:0',
-        model_path='models/approximate_scaleAdditive_vnngp_k32_beta.pth',
+        model_path='models/approximate_indvAdditive_vnngp_rbf_k16_beta_two_modes_300_lr8e-3.pth',
         trained_model=None
     )
