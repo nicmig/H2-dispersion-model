@@ -166,10 +166,17 @@ def build_dataset_temporal(
     time_max: float = 10.0,
     n_timesteps: int = 3,
     active_threshold: float = ACTIVE_THRESHOLD,
+    time_col: str = "time",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Build datasets with temporal features and full sensor vectors.
     Uses n_timesteps consecutive snapshots (default 3).
+
+    Parameters
+    ----------
+    time_col : str
+        Column to use as the temporal coordinate. Use "time_since_release" to
+        align samples by release onset instead of absolute time.
 
     Returns
     -------
@@ -178,11 +185,11 @@ def build_dataset_temporal(
     X_combined : (n_samples, 104) — concatenated [log_sensors, handcrafted_features]
     y : (n_samples,) — mass flow
     exp_ids : (n_samples,) — experiment ids
-    times : (n_samples,) — timestamps
+    times : (n_samples,) — timestamps (values from time_col)
     """
     import pandas as pd
 
-    df = df[df["time"] <= time_max].copy()
+    df = df[df[time_col] <= time_max].copy()
 
     mlp_list = []
     combined_list = []
@@ -191,8 +198,8 @@ def build_dataset_temporal(
     times = []
 
     for exp_id in df["experiment_id"].unique():
-        exp_df = df[df["experiment_id"] == exp_id].sort_values("time")
-        unique_times = exp_df["time"].unique()
+        exp_df = df[df["experiment_id"] == exp_id].sort_values(time_col)
+        unique_times = exp_df[time_col].unique()
 
         for i in range(n_timesteps - 1, len(unique_times)):
             t_now = unique_times[i]
@@ -202,7 +209,7 @@ def build_dataset_temporal(
             valid = True
             for j in range(n_timesteps):
                 t = unique_times[i - j]
-                group = exp_df[exp_df["time"] == t]
+                group = exp_df[exp_df[time_col] == t]
                 if len(group) < 29:
                     valid = False
                     break

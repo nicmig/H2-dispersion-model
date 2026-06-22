@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Create unified raw data file without any scaling.
 - CFD: use h2_volume_fraction as-is, mass_flow from column

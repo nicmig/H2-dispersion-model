@@ -261,9 +261,9 @@ def plot_results(results_mlp: Dict, save_path: Path):
     ax = axes[0]
     ax.scatter(results_mlp["y_true"], results_mlp["y_pred"], alpha=0.4, s=15, c="green", label=f"MLP (MAE={results_mlp['overall']['MAE']:.3f})")
     ax.plot([axmin, axmax], [axmin, axmax], "k--", lw=2)
-    ax.set_xlabel("True Mass Flow (g/s)")
-    ax.set_ylabel("Predicted Mass Flow (g/s)")
-    ax.set_title("MLP: Predicted vs True Mass Flow")
+    ax.set_xlabel("True Mass Flow (g/s)", fontsize=18)
+    ax.set_ylabel("Predicted Mass Flow (g/s)", fontsize=18)
+    ax.set_title("MLP: Predicted vs True Mass Flow", fontsize=20)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -276,8 +276,8 @@ def plot_results(results_mlp: Dict, save_path: Path):
     ax.bar(x, mlp_maes, color="green", alpha=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(exp_names, rotation=45, ha="right", fontsize=5)
-    ax.set_ylabel("MAE (g/s)")
-    ax.set_title("Per-Experiment MAE")
+    ax.set_ylabel("MAE (g/s)", fontsize=18)
+    ax.set_title("Per-Experiment MAE", fontsize=20)
     ax.grid(True, alpha=0.3, axis="y")
 
     # Panel 3: MLP scatter zoomed
@@ -294,9 +294,9 @@ def plot_results(results_mlp: Dict, save_path: Path):
     mlp_err = results_mlp["y_pred"] - results_mlp["y_true"]
     ax.hist(mlp_err, bins=30, alpha=0.7, color="green", label=f"MLP (μ={np.mean(mlp_err):.3f})")
     ax.axvline(0, color="black", linestyle="--")
-    ax.set_xlabel("Prediction Error (g/s)")
-    ax.set_ylabel("Count")
-    ax.set_title("Error Distribution")
+    ax.set_xlabel("Prediction Error (g/s)", fontsize=18)
+    ax.set_ylabel("Count", fontsize=18)
+    ax.set_title("Error Distribution", fontsize=20)
     ax.legend()
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -313,7 +313,7 @@ def main():
     device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    data_path = Path("data/unified_raw_two_modes.csv")
+    data_path = Path("data/unified_raw_two_modes_release_lag1.csv")
     if not data_path.exists():
         print(f"Error: {data_path} not found.")
         sys.exit(1)
@@ -321,8 +321,11 @@ def main():
     print("Loading data...")
     df = pd.read_csv(data_path)
 
-    print("\nBuilding temporal datasets (t <= 10s)...")
-    X_mlp, X_combined, y, exp_ids, _= build_dataset_temporal(df, time_max=10.0, n_timesteps=3, active_threshold=0.009)
+    print("\nBuilding temporal datasets (time_since_release <= 10s)...")
+    X_mlp, X_combined, y, exp_ids, _ = build_dataset_temporal(
+        df, time_max=10.0, n_timesteps=3, active_threshold=0.009,
+        time_col='time_since_release'
+    )
     print(f"  MLP features: {X_mlp.shape}")
     print(f"  Combined features: {X_combined.shape}")
     print(f"  Targets: {y.shape}")
@@ -361,7 +364,7 @@ def main():
 
     summary = {
         "timestamp": datetime.now().isoformat(),
-        "config": {"time_max": 10.0, "n_timesteps": 3, "n_samples": int(len(y)), "n_experiments": int(len(np.unique(exp_ids)))},
+        "config": {"time_max": 10.0, "n_timesteps": 3, "time_col": "time_since_release", "n_samples": int(len(y)), "n_experiments": int(len(np.unique(exp_ids)))},
         "mlp_overall": results_mlp["overall"],
     }
     with open(summary_path, "w") as f:
