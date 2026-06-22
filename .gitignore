@@ -1,6 +1,6 @@
 /data
 /venv
-/validation_viz
+/visualizations
 /models
 /__pycache__
 /experiments
