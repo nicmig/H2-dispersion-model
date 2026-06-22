@@ -112,6 +112,35 @@ class ExperimentLogger:
         return self.log_file
 
 
+class SourceMean(gpytorch.means.Mean):
+    """
+    Mean function that peaks at the fixed H2 release location and decays
+    spatially and temporally. Helps anchor early-time predictions to the source.
+    
+    Assumes input order:
+        [time_since_release, mass_flow, x, y, z, ...]
+    """
+    
+    def __init__(self, source_loc=(0.45, 0.5, 0.8), spatial_lengthscale=0.2,
+                 time_decay=30.0):
+        super().__init__()
+        self.register_buffer('source_loc',
+                             torch.tensor(source_loc, dtype=torch.float64))
+        self.spatial_lengthscale = spatial_lengthscale
+        self.time_decay = time_decay
+        # Learnable amplitude (optimized during training)
+        self.amplitude = torch.nn.Parameter(torch.tensor(0.1, dtype=torch.float64))
+    
+    def forward(self, x):
+        # x[:, 2:5] corresponds to (x, y, z)
+        spatial_dist_sq = ((x[:, 2:5] - self.source_loc) ** 2).sum(dim=-1)
+        spatial_term = torch.exp(-spatial_dist_sq /
+                                 (2 * self.spatial_lengthscale ** 2))
+        # x[:, 0] corresponds to time_since_release
+        time_term = torch.exp(-x[:, 0].abs() / self.time_decay)
+        return self.amplitude * spatial_term * time_term
+
+
 class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
     """
     Sparse Variational GP for H2 dispersion.
@@ -119,14 +148,17 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
     Uses inducing points to approximate the full GP posterior.
     Scales to large datasets (O(m²n) instead of O(n³)).
     
-    GP model: f(time, mass_flow, y, z) -> h2_concentration
+    GP model: f(time_since_release, mass_flow, x, y, z, h2_lag_1) -> h2_concentration
     """
     
-    def __init__(self, inducing_points,lengthscale_constraints=None):
+    def __init__(self, inducing_points, lengthscale_constraints=None,
+                 use_source_mean=False):
         """
         Args:
             inducing_points: Initial inducing point locations [n_inducing, n_features]
-            learn_inducing: Whether to optimize inducing point locations
+            lengthscale_constraints: Optional constraints on kernel lengthscales
+            use_source_mean: If True, use SourceMean peaked at the release location.
+                             If False, use ConstantMean.
         """
         # Variational distribution q(u)
         variational_dist = gpytorch.variational.CholeskyVariationalDistribution(num_inducing_points=inducing_points.size(0))
@@ -141,46 +173,44 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         
         super().__init__(variational_strategy)
         
-        self.mean_module = gpytorch.means.ConstantMean()
+        if use_source_mean:
+            self.mean_module = SourceMean()
+        else:
+            self.mean_module = gpytorch.means.ConstantMean()
         
         # additive kernel
-        """self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
+        #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
+        #self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
+        # 2d kernels
+        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
+        #self.mass_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,5)))
         self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
         self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
-        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))"""
-
-        self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,2)))
-        self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,3)))
-        self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(1,4)))
-        self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(2,3)))
-        self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(2,4)))
-        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=2, active_dims=(3,4)))
+        #self.x_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,5)))
+        self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        #self.y_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,5)))
+        #self.z_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(4,5)))
         # 3d kernels
-        """self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
+        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
         self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
         self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,3,4)))
-        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))"""
-
-        self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,2,3)))
-        self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,2,4)))
-        self.mass_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(1,3,4)))
-        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=3, active_dims=(2,3,4)))
+        self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
-        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=4, active_dims=(1,2,3,4)))
-        
-        #self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
+        self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
 
-        # 5d kernel
-        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=0.5,ard_num_dims=5, active_dims=(0,1,2,3,4)))
-        
-        #self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+        # 6d kernel (all dims including lag1)
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
 
 
         self.constant = gpytorch.kernels.ConstantKernel()
         
-        self.covar_module = self.mass_x + self.mass_y + self.mass_z + self.x_y + self.x_z + self.y_z + self.mass_x_y + self.mass_x_z + self.mass_y_z + self.x_y_z + self.mass_x_y_z + self.all + self.constant
+        self.covar_module = (self.mass_x + self.mass_y + self.mass_z +
+                             self.x_y + self.x_z + 
+                             self.y_z  + self.mass_x_y +
+                             self.mass_x_z + self.mass_y_z + self.x_y_z +
+                             self.mass_x_y_z + self.all + self.constant)
     
     def forward(self, x):
         mean = self.mean_module(x)
@@ -219,7 +249,18 @@ class ExactGPModel(gpytorch.models.ExactGP):
 
 
 class VNNGP(gpytorch.models.ApproximateGP):
-    def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256, lengthscale_constraints=None):
+    def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256,
+                 lengthscale_constraints=None, use_source_mean=False):
+        """
+        Args:
+            inducing_points: Initial inducing point locations [n_inducing, n_features]
+            likelihood: GPyTorch likelihood
+            k: Number of nearest neighbors for VNNGP
+            training_batch_size: Batch size for nearest neighbor search
+            lengthscale_constraints: Optional constraints on kernel lengthscales
+            use_source_mean: If True, use SourceMean peaked at the release location.
+                             If False, use ZeroMean.
+        """
 
         m, d = inducing_points.shape
         self.m = m
@@ -230,16 +271,23 @@ class VNNGP(gpytorch.models.ApproximateGP):
         variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.0001)
 
         super(VNNGP, self).__init__(variational_strategy)
-        self.mean_module = gpytorch.means.ZeroMean()
+        if use_source_mean:
+            self.mean_module = SourceMean()
+        else:
+            self.mean_module = gpytorch.means.ZeroMean()
         #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
         #self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
         # 2d kernels
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
+        self.mass_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,5)))
         self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
         self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
+        self.x_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,5)))
         self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
+        self.y_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,5)))
+        self.z_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(4,5)))
         # 3d kernels
         self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
         self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
@@ -248,13 +296,17 @@ class VNNGP(gpytorch.models.ApproximateGP):
         # 4d kernel
         self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
 
-        # 5d kernel
-        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
+        # 6d kernel (all dims including lag1)
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=6, active_dims=(0,1,2,3,4,5)))
 
 
         self.constant = gpytorch.kernels.ConstantKernel()
         
-        self.covar_module = self.mass_x + self.mass_y + self.mass_z + self.x_y + self.x_z + self.y_z + self.mass_x_y + self.mass_x_z + self.mass_y_z + self.x_y_z + self.mass_x_y_z + self.all + self.constant
+        self.covar_module = (self.mass_x + self.mass_y + self.mass_z + self.mass_lag1 +
+                             self.x_y + self.x_z + self.x_lag1 + self.y_z +
+                             self.y_lag1 + self.z_lag1 + self.mass_x_y +
+                             self.mass_x_z + self.mass_y_z + self.x_y_z +
+                             self.mass_x_y_z + self.all + self.constant)
 
         self.likelihood = likelihood
     def forward(self, x: torch.Tensor):
@@ -555,7 +607,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                        trained_model: Optional[str] = None,
                                        val_every_n_epochs: int = 10,
                                        early_stopping_patience: int = 50,
-                                       mass_flow_lengthscale_min: float = 0.1):
+                                       mass_flow_lengthscale_min: float = 0.1,
+                                       use_source_mean: bool = False):
     """
     Train Sparse Variational GP (Approximate GP) with inducing points.
     
@@ -612,7 +665,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
     if likelihood_type == "gaussian":
         x_scaler = StandardScaler()
         y_scaler = StandardScaler()
-        X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
+        #X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
+        X = df_train[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
         x_scaler.fit(X)
         x_scaled = x_scaler.transform(X)
         y = df_train['h2_volume_fraction'].values
@@ -627,7 +681,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
         train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
-        X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
+        #X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
+        X_val = df_val[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
         x_val_scaled = x_scaler.transform(X_val)
         y_val = df_val['h2_volume_fraction'].values
         y_val_log = np.log(y_val + LOG_EPSILON)
@@ -640,13 +695,14 @@ def train_h2_dispersion_gp_approximate_additive(df,
         val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
-        print(f"Input dimensions: mass_flow, x,  y, z")
+        #print(f"Input dimensions: mass_flow, x,  y, z")
         print(f"Target: log(y)")
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
     elif likelihood_type == 'beta':
         x_scaler = StandardScaler()
-        X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
+        #X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
+        X = df_train[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
         x_scaler.fit(X)
         x_scaled = x_scaler.transform(X)
         y = df_train['h2_volume_fraction'].values
@@ -658,7 +714,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
         train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
-        X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
+        #X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
+        X_val = df_val[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
         x_val_scaled = x_scaler.transform(X_val)
         y_val = df_val['h2_volume_fraction'].values
 
@@ -669,7 +726,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
-        print(f"Input dimensions: time, mass_flow, x, y, z")
+        #print(f"Input dimensions: time, mass_flow, x, y, z")
 
         likelihood = gpytorch.likelihoods.BetaLikelihood().double().to(device)
     else:
@@ -685,14 +742,16 @@ def train_h2_dispersion_gp_approximate_additive(df,
         'learning_rate': learning_rate,
         'device': device,
         'model_type': model_type,
-        'likelihood_type': likelihood_type
+        'likelihood_type': likelihood_type,
+        'use_source_mean': use_source_mean
     })
     
     if model_type == "SVGP":
         # Select inducing points using k-means
         inducing_points = select_inducing_points(X, n_inducing=n_inducing, method='kmeans')
         inducing_points = inducing_points.to(device) 
-        model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
+        model = SparseH2DispersionGP(inducing_points=inducing_points,
+                                      use_source_mean=use_source_mean).double().to(device)
         model.train()
         likelihood.train()
         optimizer = torch.optim.AdamW([{'params' : model.parameters()}, {'params': likelihood.parameters()}], lr=learning_rate)
@@ -783,7 +842,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                 'training_batch_size': training_batch_size,
                                 'n_inducing': n_inducing,
                                 'likelihood_type': likelihood_type,
-                                'lengthscale_constraints': None
+                                'lengthscale_constraints': None,
+                                'use_source_mean': use_source_mean
                             }
                         )
                 else:
@@ -808,7 +868,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                         'training_batch_size': training_batch_size,
                         'n_inducing': n_inducing,
                         'likelihood_type': likelihood_type,
-                        'lengthscale_constraints': None  # Not serializable; stored in model state
+                        'lengthscale_constraints': None,  # Not serializable; stored in model state
+                        'use_source_mean': use_source_mean
                     }
                 )
         
@@ -845,7 +906,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
             model = VNNGP(
                 inducing_points=inducing_points, likelihood=likelihood,
                 k=k, training_batch_size=training_batch_size,
-                lengthscale_constraints=lengthscale_constraints
+                lengthscale_constraints=lengthscale_constraints,
+                use_source_mean=use_source_mean
             ).double().to(device)
             model.load_state_dict(checkpoint['model_state_dict'])
             likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
@@ -854,7 +916,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
             model = VNNGP(
                 inducing_points=x_train, likelihood=likelihood,
                 k=k, training_batch_size=training_batch_size,
-                lengthscale_constraints=lengthscale_constraints
+                lengthscale_constraints=lengthscale_constraints,
+                use_source_mean=use_source_mean
             ).double().to(device)
         num_batches = model.variational_strategy._total_training_batches
         model.train()
@@ -946,7 +1009,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                 'k': k,
                                 'training_batch_size': training_batch_size,
                                 'n_inducing': n_inducing,
-                                'likelihood_type': likelihood_type
+                                'likelihood_type': likelihood_type,
+                                'use_source_mean': use_source_mean
                             }
                         )
                 else:
@@ -970,7 +1034,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                         'k': k,
                         'training_batch_size': training_batch_size,
                         'n_inducing': n_inducing,
-                        'likelihood_type': likelihood_type
+                        'likelihood_type': likelihood_type,
+                        'use_source_mean': use_source_mean
                     }
                 )
         
@@ -1013,7 +1078,8 @@ def train_h2_dispersion_gp_approximate_additive(df,
                 'k': k,
                 'training_batch_size': training_batch_size,
                 'n_inducing': n_inducing,
-                'likelihood_type': likelihood_type
+                'likelihood_type': likelihood_type,
+                'use_source_mean': use_source_mean
             }
         )
 
@@ -1131,7 +1197,8 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     is_vnngp = isinstance(model, VNNGP)
     
     # Prepare test data
-    X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
+    #X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
+    X_test = df_test[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
     y_test = df_test['h2_volume_fraction'].values
     
     # Apply input scaling if scaler was used during training
@@ -1296,13 +1363,15 @@ def load_model(checkpoint_path, device='cpu'):
         k = hyperparams.get('k', 64)
         training_batch_size = hyperparams.get('training_batch_size', 1024)
         lengthscale_constraints = hyperparams.get('lengthscale_constraints', None)
+        use_source_mean = hyperparams.get('use_source_mean', False)
         
         model = VNNGP(
             inducing_points=inducing_points,
             likelihood=likelihood,
             k=k,
             training_batch_size=training_batch_size,
-            lengthscale_constraints=lengthscale_constraints
+            lengthscale_constraints=lengthscale_constraints,
+            use_source_mean=use_source_mean
         ).double().to(device)
         
     elif model_type == 'ExactGP':
@@ -1314,7 +1383,9 @@ def load_model(checkpoint_path, device='cpu'):
     else:
         # Default: SparseH2DispersionGP (SVGP)
         inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points'].to(device)
-        model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
+        use_source_mean = hyperparams.get('use_source_mean', False)
+        model = SparseH2DispersionGP(inducing_points=inducing_points,
+                                     use_source_mean=use_source_mean).double().to(device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
