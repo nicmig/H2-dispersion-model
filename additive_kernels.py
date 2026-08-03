@@ -1,16 +1,8 @@
 """
 Additive Kernels for Gaussian Processes
 
-Implements the full additive kernel from:
-Duvenaud et al. (2011) - "Additive Gaussian Processes"
+Implements two different additive kernels based on Duvenaud et al. (2011) - "Additive Gaussian Processes"
 
-The full additive kernel models interactions of all orders:
-k(x, x') = Σ_{d=1}^D Σ_{|S|=d} σ²_S ∏_{i∈S} k_i(x_i, x'_i)
-
-Where:
-- S are all non-empty subsets of dimensions
-- σ²_S are outputscales for each interaction term
-- k_i are base kernels on individual dimensions
 """
 
 import torch
@@ -25,9 +17,9 @@ from itertools import combinations
 from typing import Optional
 
 
-class FullAdditiveKernel(Kernel):
+class KernelWeightedAdditiveKernel(Kernel):
     """
-    Naive Full Additive Kernel.
+    Kernel-weighted Additive Kernel.
     
     This kernel decomposes the function into a sum of interactions of all orders:
     - 1st order: individual dimensions
@@ -35,7 +27,8 @@ class FullAdditiveKernel(Kernel):
     - 3rd order: triples of dimensions
     - etc.
     
-    For D dimensions, there are 2^D - 1 terms.
+    For D dimensions, there are 2^D - 1 terms. Each dimension has its own kernel with its own output scale σ².
+    This results in D output scales to optimize.
     
     Args:
         base_kernels: List of scalable base kernels, one per dimension
@@ -76,7 +69,7 @@ class FullAdditiveKernel(Kernel):
             elif base_kernel_type.lower() == 'matern52':
                 k = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.MaternKernel(nu=2.5, active_dims=[i]), outputscale_prior=outputscale_prior)
             else:
-                raise ValueError(f"Unknown kernel type: {base_kernel_type}")
+                raise ValueError(f"Unknown kernel type: {base_kernel_type}. Only RBF kernel and Matern kernel are implemented.")
             
             base_kernels.append(k)
         self.base_kernels = torch.nn.ModuleList(base_kernels)
@@ -142,9 +135,9 @@ class FullAdditiveKernel(Kernel):
         return res
 
 
-class ScaleAdditiveKernel(Kernel):
+class SubsetWeightedAdditiveKernel(Kernel):
     """
-    Naive Full Additive Kernel.
+    Subset-weighted Additive Kernel.
     
     This kernel decomposes the function into a sum of interactions of all orders:
     - 1st order: individual dimensions
@@ -152,7 +145,9 @@ class ScaleAdditiveKernel(Kernel):
     - 3rd order: triples of dimensions
     - etc.
     
-    For D dimensions, there are 2^D - 1 terms.
+    For D dimensions, there are 2^D - 1 terms. Each subset has its own output scale σ².
+    This results in 2^D - 1 output scales and limits this method to lower dimension data because this method
+    is computationally expensive but increases the interpretability.
     
     Args:
         base_kernels: List of scalable base kernels, one per dimension
@@ -164,7 +159,7 @@ class ScaleAdditiveKernel(Kernel):
         >>> k3 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
         >>> additive_kernel = FullAdditiveKernel([k1, k2, k3])
         >>> 
-        >>> # This creates: k = σ²₁k₁ + σ²₂k₂ + σ²₃k₃ + σ²k₁k₂ + σ²k₁k₃ + σ²k₂k₃ + σ²k₁k₂k₃
+        >>> # This creates: k = σ²₁k₁ + σ²₂k₂ + σ²₃k₃ + σ²₄k₁k₂ + σ²₅k₁k₃ + σ²₆k₂k₃ + σ²₇k₁k₂k₃
     
     """
 
@@ -213,7 +208,7 @@ class ScaleAdditiveKernel(Kernel):
                     **kwargs
                 )
             else:
-                raise ValueError(f"Unknown kernel type: {base_kernel_type}")
+                raise ValueError(f"Unknown kernel type: {base_kernel_type}. Only RBF kernel and Matern kernel are implemented.")
             
             base_kernels.append(k)
         self.base_kernels = torch.nn.ModuleList(base_kernels)
