@@ -10,7 +10,7 @@ Supports:
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 
-# Sensor positions from create_unified_raw.py
+# Sensor positions from build_dataset.py
 SENSOR_POSITIONS = {
     1: (0.77, 0.24, 0.8), 2: (0.46, 0.0, 0.8), 3: (0.48, 0.25, 0.52),
     4: (0.13, 0.26, 0.8), 5: (0.48, 1.33, 0.52), 6: (0.46, 1.11, 0.8),
@@ -55,7 +55,6 @@ def extract_features(
     time: float,
     sensor_positions: Optional[Dict[int, Tuple[float, float, float]]] = None,
     active_threshold: float = ACTIVE_THRESHOLD,
-    origin: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
     """Extract handcrafted features from a single timestep's sensor observations."""
     if sensor_positions is None:
