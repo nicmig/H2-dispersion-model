@@ -1,14 +1,17 @@
 """
-Create unified raw data file without any scaling.
-- CFD: use h2_volume_fraction as-is, mass_flow from column
-- Experiments: use H2 concentration / 100, mass flow from "mean mass flow"
-- No scaling, no delay embeddings, just unified raw data
+Build unified datasets for the H2 dispersion pipeline.
+
+Supports two dataset modes (selected in config.json):
+- raw: combine resampled CFD and/or experimental data with minimal processing.
+- preprocessed: raw preprocessing plus end-of-release cut-off and release-onset
+  features (t_release, time_since_release, h2_lag_1, optional h2_initial).
 """
 
 import pandas as pd
 import numpy as np
 from scipy import signal
 import re
+import json
 import logging
 from pathlib import Path
 
@@ -78,6 +81,53 @@ SENSOR_POSITIONS = {
     26: (0.46, 2.46, 0.27), 27: (0.47, 2.23, 0.0), 28: (0.47, 3.56, 0.27),
     29: (0.47, 4.63, 0.27), 30: (0.46, 4.44, 0.0),
 }
+
+
+def load_config(config_path: str = 'config.json') -> dict:
+    """Load pipeline configuration from JSON.
+
+    Defaults are provided so the script still runs if the config file is
+    missing, but in normal use the repository ships with config.json at the
+    root.
+    """
+    default_config = {
+        "data_sources": {
+            "include_experiments": True,
+            "include_cfd": False,
+        },
+        "dataset_type": "raw",
+        "release_onset": {
+            "threshold": 0.009,
+            "include_initial": False,
+            "include_lag1": True,
+        },
+        "paths": {
+            "data_dir": "data",
+            "experiments_dir": "data/raw",
+            "cfd_dir": "data/CFD",
+            "raw_output_csv": "data/unified_raw.csv",
+            "raw_output_summary": "data/unified_raw_summary.txt",
+            "preprocessed_output_csv": "data/unified_preprocessed.csv",
+            "preprocessed_output_summary": "data/unified_preprocessed_summary.txt",
+        },
+    }
+
+    config_file = Path(config_path)
+    if config_file.exists():
+        with open(config_file, 'r') as f:
+            user_config = json.load(f)
+        # Merge nested structures rather than replacing wholesale
+        for key in default_config:
+            if isinstance(default_config[key], dict):
+                default_config[key].update(user_config.get(key, {}))
+            else:
+                default_config[key] = user_config.get(key, default_config[key])
+    else:
+        logger.warning(
+            f"Config file {config_path} not found; using default settings."
+        )
+
+    return default_config
 
 
 def process_and_resample_cfd_sensor(data_file, sensor_num, scenario_name, mass_flow):
@@ -283,58 +333,224 @@ def assign_split(df, exp_name):
         return 'train'
 
 
+def add_release_onset_features(
+    df: pd.DataFrame,
+    threshold: float = 0.009,
+    include_initial: bool = False,
+    include_lag1: bool = True,
+) -> pd.DataFrame:
+    """
+    Add release-onset features to a unified raw DataFrame.
+
+    For each scenario the first time any sensor exceeds ``threshold`` becomes
+    ``t_release``. ``time_since_release = time - t_release`` then replaces the
+    original ``time`` column. Optionally adds ``h2_initial`` and ``h2_lag_1``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Unified raw dataset with 'scenario', 'experiment_id', 'sensor_id',
+        'time' and 'h2_volume_fraction' columns.
+    threshold : float
+        H2 volume-fraction threshold used to detect the release onset.
+    include_initial : bool
+        Whether to add an ``h2_initial`` column per (scenario, experiment, sensor).
+    include_lag1 : bool
+        Whether to add ``h2_lag_1`` and drop rows where it is missing.
+
+    Returns
+    -------
+    pd.DataFrame
+        Preprocessed dataset with ``time_since_release`` instead of ``time``.
+    """
+    df = df.copy()
+
+    # Per-scenario release onset: first time any sensor exceeds threshold
+    active = df[df['h2_volume_fraction'] > threshold]
+    if len(active) == 0:
+        raise ValueError(f"No readings exceed threshold {threshold}")
+
+    scenario_onset = active.groupby('scenario')['time'].min().reset_index()
+    scenario_onset.columns = ['scenario', 't_release']
+    logger.info(f"Release onset times (threshold={threshold}):")
+    logger.info('\n' + scenario_onset.to_string(index=False))
+
+    df = df.merge(scenario_onset, on='scenario', how='left')
+
+    # Scenarios with no readings above threshold get t_release = min time
+    if df['t_release'].isna().any():
+        logger.warning(
+            "Some scenarios have no reading above threshold; using min time for t_release."
+        )
+        scenario_min_time = df.groupby('scenario')['time'].min().reset_index()
+        scenario_min_time.columns = ['scenario', 'min_time']
+        df = df.merge(scenario_min_time, on='scenario', how='left')
+        df['t_release'] = df['t_release'].fillna(df['min_time'])
+        df = df.drop(columns=['min_time'])
+
+    # Time since release replaces the original time coordinate
+    df['time_since_release'] = df['time'] - df['t_release']
+
+    group_cols = ['scenario', 'experiment_id', 'sensor_id']
+    df = df.sort_values(group_cols + ['time'])
+
+    # Optional: initial condition at t_release
+    if include_initial:
+        df['time_diff_to_release'] = (df['time'] - df['t_release']).abs()
+        idx_closest = df.groupby(group_cols)['time_diff_to_release'].idxmin()
+        initial_conditions = df.loc[
+            idx_closest, group_cols + ['h2_volume_fraction']
+        ].copy()
+        initial_conditions = initial_conditions.rename(
+            columns={'h2_volume_fraction': 'h2_initial'}
+        )
+        df = df.merge(initial_conditions, on=group_cols, how='left')
+        df = df.drop(columns=['time_diff_to_release'])
+
+    # Optional: lag-1 concentration
+    if include_lag1:
+        df['h2_lag_1'] = df.groupby(group_cols)['h2_volume_fraction'].shift(1)
+        n_before = len(df)
+        df = df.dropna(subset=['h2_lag_1'])
+        logger.info(
+            f"Dropped {n_before - len(df)} rows with missing h2_lag_1"
+        )
+
+    # Replace the original time column with time_since_release
+    df = df.drop(columns=['time'])
+
+    return df
+
+
 def main():
-    data_dir = Path('/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model/data')
-    cfd_dir = data_dir / 'CFD'
-    exp_dir = data_dir / 'raw'
-    
+    config = load_config()
+    data_sources = config['data_sources']
+    paths = config['paths']
+    dataset_type = config.get('dataset_type', 'raw')
+    release_onset_cfg = config.get('release_onset', {})
+
+    if dataset_type not in ('raw', 'preprocessed'):
+        raise ValueError(
+            f"Invalid dataset_type '{dataset_type}' in config.json. "
+            "Use 'raw' or 'preprocessed'."
+        )
+
+    # Resolve relative paths against the config file location, falling back to CWD
+    config_file = Path('config.json').resolve()
+    base_dir = config_file.parent if config_file.exists() else Path.cwd()
+    data_dir = base_dir / paths['data_dir']
+    cfd_dir = base_dir / paths['cfd_dir']
+    exp_dir = base_dir / paths['experiments_dir']
+
+    if dataset_type == 'raw':
+        output_file = base_dir / paths['raw_output_csv']
+        summary_file = base_dir / paths['raw_output_summary']
+    else:
+        output_file = base_dir / paths['preprocessed_output_csv']
+        summary_file = base_dir / paths['preprocessed_output_summary']
+
+    include_cfd = data_sources.get('include_cfd', False)
+    include_experiments = data_sources.get('include_experiments', True)
+
+    logger.info("Configuration:")
+    logger.info(f"  dataset_type: {dataset_type}")
+    logger.info(f"  include_experiments: {include_experiments}")
+    logger.info(f"  include_cfd: {include_cfd}")
+    logger.info(f"  data_dir: {data_dir}")
+    logger.info(f"  output_file: {output_file}")
+    logger.info("")
+
+    if not include_experiments and not include_cfd:
+        raise ValueError(
+            "At least one data source must be enabled in config.json."
+        )
+
     all_data = []
-    
-    logger.info("Processing CFD data...")
-    logger.info("=" * 50)
-    
-    # Process CFD scenarios
-    for scenario in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'O1', 'O2']:
-        scenario_dir = cfd_dir / scenario
-        if not scenario_dir.exists():
-            continue
-        
-        logger.info(f"Processing CFD scenario {scenario}...")
-        df_cfd = process_cfd_scenario(scenario_dir, scenario)
-        if not df_cfd.empty:
-            # Each sensor is already resampled individually in process_cfd_scenario
-            df_cfd['split'] = 'train'
-            all_data.append(df_cfd)
-            logger.info(f"  Added {len(df_cfd)} records (mass_flow: {df_cfd['mass_flow'].iloc[0]:.3f}, H2 max: {df_cfd['h2_volume_fraction'].max():.4f})")
-    
-    logger.info("Processing experimental data...")
-    logger.info("=" * 50)
-    
-    # Process experimental data
-    for exp_folder in sorted(exp_dir.iterdir()):
-        if not exp_folder.is_dir():
-            continue
-        exp_name = exp_folder.name
-        csv_files = list(exp_folder.glob('*.csv'))
-        if not csv_files:
-            continue
-        exp_file = csv_files[0]
-        
-        logger.info(f"Processing {exp_name}...")
-        df_exp = process_experiment(exp_file, exp_name)
-        if not df_exp.empty:
-            df_exp = shift_time_to_mass_flow_start(df_exp, exp_name)
-            # Filter: keep only data where leakage is still present
-            df_exp = cut_off_time(df_exp,exp_name)
-            #df_exp = df_exp[df_exp['time'] <= 240]
-            df_exp['split'] = assign_split(df_exp, exp_name)
-            split_name = df_exp['split'].iloc[0]
-            all_data.append(df_exp)
-            logger.info(f"  Added {len(df_exp)} records -> {split_name} (mass_flow: {df_exp['mass_flow'].iloc[0]:.3f}, H2 max: {df_exp['h2_volume_fraction'].max():.4f})")
-    
+
+    # ------------------------------------------------------------------
+    # CFD scenarios
+    # ------------------------------------------------------------------
+    if include_cfd:
+        if not cfd_dir.exists():
+            raise FileNotFoundError(
+                f"CFD data directory not found: {cfd_dir}\n"
+                "Set include_cfd to false in config.json if you do not have the CFD data."
+            )
+
+        logger.info("Processing CFD data...")
+        logger.info("=" * 50)
+
+        for scenario in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'O1', 'O2']:
+            scenario_dir = cfd_dir / scenario
+            if not scenario_dir.exists():
+                continue
+
+            logger.info(f"Processing CFD scenario {scenario}...")
+            df_cfd = process_cfd_scenario(scenario_dir, scenario)
+            if not df_cfd.empty:
+                # Each sensor is already resampled individually in process_cfd_scenario
+                df_cfd['split'] = 'train'
+                all_data.append(df_cfd)
+                logger.info(
+                    f"  Added {len(df_cfd)} records "
+                    f"(mass_flow: {df_cfd['mass_flow'].iloc[0]:.3f}, "
+                    f"H2 max: {df_cfd['h2_volume_fraction'].max():.4f})"
+                )
+    else:
+        logger.info("Skipping CFD data (include_cfd is false).")
+
+    # ------------------------------------------------------------------
+    # Experimental data
+    # ------------------------------------------------------------------
+    if include_experiments:
+        if not exp_dir.exists():
+            raise FileNotFoundError(
+                f"Experimental data directory not found: {exp_dir}\n"
+                "Download the open dataset and place it under the configured experiments_dir."
+            )
+
+        logger.info("Processing experimental data...")
+        logger.info("=" * 50)
+
+        for exp_folder in sorted(exp_dir.iterdir()):
+            if not exp_folder.is_dir():
+                continue
+            exp_name = exp_folder.name
+            csv_files = list(exp_folder.glob('*.csv'))
+            if not csv_files:
+                continue
+            exp_file = csv_files[0]
+
+            logger.info(f"Processing {exp_name}...")
+            df_exp = process_experiment(exp_file, exp_name)
+            if not df_exp.empty:
+                if dataset_type == 'preprocessed':
+                    # Cut off the tail where the experiment has ended.
+                    # Release-onset alignment replaces the mass-flow-start shift.
+                    df_exp = cut_off_time(df_exp, exp_name)
+                df_exp['split'] = assign_split(df_exp, exp_name)
+                split_name = df_exp['split'].iloc[0]
+                all_data.append(df_exp)
+                logger.info(
+                    f"  Added {len(df_exp)} records -> {split_name} "
+                    f"(mass_flow: {df_exp['mass_flow'].iloc[0]:.3f}, "
+                    f"H2 max: {df_exp['h2_volume_fraction'].max():.4f})"
+                )
+    else:
+        logger.info("Skipping experimental data (include_experiments is false).")
+
+    # ------------------------------------------------------------------
+    # Combine and save
+    # ------------------------------------------------------------------
+    if not all_data:
+        raise ValueError(
+            "No data was processed. Check that the configured directories "
+            "contain the expected files and that at least one data source is enabled."
+        )
+
     logger.info("Combining data...")
     df_all = pd.concat(all_data, ignore_index=True)
-    
+
     # Add active/inactive label based on H2 volume fraction threshold
     df_all['active'] = (df_all['h2_volume_fraction'] > ACTIVE_THRESHOLD).astype(int)
     n_active = df_all['active'].sum()
@@ -342,41 +558,76 @@ def main():
     logger.info(f"Active/inactive label added (threshold={ACTIVE_THRESHOLD})")
     logger.info(f"  Active:   {n_active:,} ({100*n_active/len(df_all):.1f}%)")
     logger.info(f"  Inactive: {n_inactive:,} ({100*n_inactive/len(df_all):.1f}%)")
-    
-    # Save unified raw data
-    output_file = data_dir / 'unified_raw_two_modes.csv'
+
+    # ------------------------------------------------------------------
+    # Release-onset preprocessing (preprocessed mode only)
+    # ------------------------------------------------------------------
+    if dataset_type == 'preprocessed':
+        logger.info("Adding release-onset features...")
+        df_all = add_release_onset_features(
+            df_all,
+            threshold=release_onset_cfg.get('threshold', 0.009),
+            include_initial=release_onset_cfg.get('include_initial', False),
+            include_lag1=release_onset_cfg.get('include_lag1', True),
+        )
+
+        n_before_release = (df_all['time_since_release'] < 0).sum()
+        n_after_release = (df_all['time_since_release'] >= 0).sum()
+        logger.info(f"  Records before release: {n_before_release:,}")
+        logger.info(f"  Records at/after release: {n_after_release:,}")
+
+    # Save dataset
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     df_all.to_csv(output_file, index=False)
-    logger.info(f"Saved unified raw data: {output_file} ({len(df_all)} records)")
-    
+    logger.info(f"Saved {dataset_type} dataset: {output_file} ({len(df_all)} records)")
+
     # Generate summary statistics
     logger.info("Generating summary statistics...")
-    
+
     summary_lines = []
     summary_lines.append("=" * 60)
-    summary_lines.append("Summary Statistics (Raw Data)")
+    summary_lines.append(f"Summary Statistics ({dataset_type.capitalize()} Data)")
     summary_lines.append("=" * 60)
     summary_lines.append(f"\nTotal records: {len(df_all):,}")
     summary_lines.append(f"Columns: {list(df_all.columns)}")
     summary_lines.append("")
-    
-    summary_lines.append("CFD Scenarios:")
-    summary_lines.append("-" * 40)
-    cfd_summary = df_all[df_all['source'] == 'cfd'].groupby('scenario').agg({
-        'mass_flow': 'first',
-        'h2_volume_fraction': ['min', 'max', 'mean'],
-        'experiment_id': 'count'
-    }).round(4)
-    summary_lines.append(cfd_summary.to_string())
-    
+
+    cfd_records = df_all[df_all['source'] == 'cfd']
+    if not cfd_records.empty:
+        summary_lines.append("CFD Scenarios:")
+        summary_lines.append("-" * 40)
+        cfd_summary = cfd_records.groupby('scenario').agg({
+            'mass_flow': 'first',
+            'h2_volume_fraction': ['min', 'max', 'mean'],
+            'experiment_id': 'count'
+        }).round(4)
+        summary_lines.append(cfd_summary.to_string())
+    else:
+        summary_lines.append("CFD Scenarios: none included")
+
     summary_lines.append("\nExperiments (all):")
     summary_lines.append("-" * 40)
-    exp_summary = df_all[df_all['source'] == 'experiment'].groupby('experiment_id').agg({
-        'mass_flow': 'first',
-        'h2_volume_fraction': ['min', 'max', 'mean'],
-        'split': 'first'
-    }).round(4)
-    summary_lines.append(exp_summary.to_string())
-    
+    exp_records = df_all[df_all['source'] == 'experiment']
+    if not exp_records.empty:
+        exp_summary = exp_records.groupby('experiment_id').agg({
+            'mass_flow': 'first',
+            'h2_volume_fraction': ['min', 'max', 'mean'],
+            'split': 'first'
+        }).round(4)
+        summary_lines.append(exp_summary.to_string())
+    else:
+        summary_lines.append("Experiments: none included")
+
+    if dataset_type == 'preprocessed' and 'time_since_release' in df_all.columns:
+        summary_lines.append("\nRelease-onset timing:")
+        summary_lines.append("-" * 40)
+        summary_lines.append(
+            df_all.groupby('scenario')['time_since_release']
+            .agg(['min', 'max', 'mean'])
+            .round(4)
+            .to_string()
+        )
+
     summary_lines.append("\nOverall Statistics:")
     summary_lines.append("-" * 40)
     summary_lines.append(f"Sources: {df_all['source'].value_counts().to_dict()}")
@@ -386,13 +637,13 @@ def main():
     summary_lines.append(df_all.groupby('source')['h2_volume_fraction'].describe().to_string())
     summary_lines.append(f"\nMass Flow by source:")
     summary_lines.append(df_all.groupby('source')['mass_flow'].describe().to_string())
-    
+
     # Save summary to file
-    summary_file = data_dir / 'unified_raw_summary_two_modes.txt'
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
     with open(summary_file, 'w') as f:
         f.write('\n'.join(summary_lines))
     logger.info(f"Saved summary statistics: {summary_file}")
-    
+
     # Also log the summary
     logger.info("\n" + "\n".join(summary_lines))
 
