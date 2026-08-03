@@ -1,0 +1,22 @@
+{
+  "data_sources": {
+    "include_experiments": true,
+    "include_cfd": false
+  },
+  "dataset_type": "raw",
+  "release_onset": {
+    "threshold": 0.009,
+    "include_initial": false,
+    "include_lag1": true
+  },
+  "paths": {
+    "data_dir": "data",
+    "experiments_dir": "data/raw",
+    "cfd_dir": "data/CFD",
+    "raw_output_csv": "data/unified_raw.csv",
+    "raw_output_summary": "data/unified_raw_summary.txt",
+    "preprocessed_output_csv": "data/unified_preprocessed.csv",
+    "preprocessed_output_summary": "data/unified_preprocessed_summary.txt"
+  },
+  "_comment": "Set dataset_type to 'raw' or 'preprocessed'. Set include_cfd to true only if you have the private CFD data."
+}
