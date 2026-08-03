@@ -27,6 +27,8 @@ import time as time_module
 from pathlib import Path
 import matplotlib.pyplot as plt
 import json
+import argparse
+import sys
 from datetime import datetime
 from tqdm import tqdm
 
@@ -1405,29 +1407,144 @@ def load_model(checkpoint_path, device='cpu'):
     return model, likelihood, checkpoint
 
 
+def load_training_config(config_path: str = 'config_training.json') -> dict:
+    """
+    Load training configuration from JSON.
+
+    Supports two trainers:
+      - 'exact': Exact GP (uses columns time, mass_flow, x, y, z).
+      - 'approximate_additive': SVGP or VNNGP with additive kernel
+        (uses columns time_since_release, mass_flow, x, y, z, h2_lag_1).
+
+    Parameters
+    ----------
+    config_path : str
+        Path to the JSON config file.
+
+    Returns
+    -------
+    dict
+        Merged configuration with defaults filled in.
+    """
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(
+            f"Training config not found: {config_path}\n"
+            "Create it from config_training.json or pass --config <path>."
+        )
+
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+
+    # Common defaults
+    default_config = {
+        "data": {
+            "csv_path": "data/unified_preprocessed.csv"
+        },
+        "training": {
+            "trainer": "approximate_additive",
+            "split_ratio": 0.2,
+            "n_epochs": 200,
+            "learning_rate": 0.005,
+            "device": "cpu",
+            "model_path": None,
+        },
+    }
+
+    # Merge top-level keys
+    for key in default_config:
+        if isinstance(default_config[key], dict):
+            default_config[key].update(config.get(key, {}))
+        else:
+            default_config[key] = config.get(key, default_config[key])
+
+    # Validate trainer
+    trainer = default_config['training'].get('trainer')
+    if trainer not in ('exact', 'approximate_additive'):
+        raise ValueError(
+            f"Unknown trainer '{trainer}'. Use 'exact' or 'approximate_additive'."
+        )
+
+    # Validate model_type and likelihood_type for approximate_additive
+    if trainer == 'approximate_additive':
+        model_type = default_config['training'].get('model_type', 'VNNGP')
+        likelihood_type = default_config['training'].get('likelihood_type', 'gaussian')
+        if model_type not in ('SVGP', 'VNNGP'):
+            raise ValueError(
+                f"Unknown model_type '{model_type}'. Use 'SVGP' or 'VNNGP'."
+            )
+        if likelihood_type not in ('gaussian', 'beta'):
+            raise ValueError(
+                f"Unknown likelihood_type '{likelihood_type}'. "
+                "Use 'gaussian' or 'beta'."
+            )
+
+    return default_config
+
+
 # ============================================================================
 # EXAMPLE USAGE
 # ============================================================================
 
 if __name__ == "__main__":
-    
-    # Load data
-    df = pd.read_csv('data/unified_preprocessed.csv')
-    
-    # Train on training set only
-    print("\nTraining GP model...")
 
-    model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
-        df=df,
-        split_ratio=0.2,
-        n_inducing=6000,
-        k=16,
-        training_batch_size=1024,
-        model_type="VNNGP",
-        likelihood_type="beta",
-        n_epochs=300,
-        learning_rate=0.008,
-        device='cuda:0',
-        model_path='models/approximate_indvAdditive_vnngp_rbf_k16_beta_300_lr8e-3.pth',
-        trained_model=None
+    parser = argparse.ArgumentParser(
+        description="Train the H2 dispersion GP model from a JSON config."
     )
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config_training.json',
+        help='Path to the training configuration JSON (default: config_training.json)',
+    )
+    args = parser.parse_args()
+
+    config = load_training_config(args.config)
+    data_cfg = config['data']
+    train_cfg = config['training']
+    trainer = train_cfg['trainer']
+
+    # Load data
+    csv_path = Path(data_cfg['csv_path'])
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {csv_path}\n"
+            "Build it first with python build_dataset.py or update config_training.json."
+        )
+
+    df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df):,} rows from {csv_path}")
+
+    # Train on training set only
+    print(f"\nTraining GP model (trainer='{trainer}')...")
+
+    if trainer == 'exact':
+        model, likelihood, history = train_h2_dispersion_gp(
+            df=df,
+            split_ratio=train_cfg.get('split_ratio', 0.2),
+            n_epochs=train_cfg.get('n_epochs', 200),
+            learning_rate=train_cfg.get('learning_rate', 0.005),
+            device=train_cfg.get('device', 'cpu'),
+            model_path=train_cfg.get('model_path'),
+        )
+    elif trainer == 'approximate_additive':
+        model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
+            df=df,
+            split_ratio=train_cfg.get('split_ratio', 0.2),
+            n_inducing=train_cfg.get('n_inducing', 500),
+            k=train_cfg.get('k', 64),
+            training_batch_size=train_cfg.get('training_batch_size', 512),
+            model_type=train_cfg.get('model_type', 'VNNGP'),
+            likelihood_type=train_cfg.get('likelihood_type', 'gaussian'),
+            n_epochs=train_cfg.get('n_epochs', 200),
+            learning_rate=train_cfg.get('learning_rate', 0.01),
+            device=train_cfg.get('device', 'cpu'),
+            model_path=train_cfg.get('model_path'),
+            trained_model=train_cfg.get('trained_model'),
+            val_every_n_epochs=train_cfg.get('val_every_n_epochs', 10),
+            early_stopping_patience=train_cfg.get('early_stopping_patience', 50),
+            mass_flow_lengthscale_min=train_cfg.get('mass_flow_lengthscale_min', 0.1),
+            use_source_mean=train_cfg.get('use_source_mean', False),
+        )
+
+    print("\nTraining finished.")
