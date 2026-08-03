@@ -116,20 +116,83 @@ The preprocessed dataset contains `time_since_release`, `t_release`, and `h2_lag
 ### 2. Train the Stage 1 mass-flow estimator
 
 ```bash
-python massflow_estimator.py
+python run_stage1_massflow_estimator.py
 ```
 
 This reads `data/unified_preprocessed.csv` and trains the MLP ensemble used for early-time leakage-rate estimation.
 
 ### 3. Train the GP dispersion model
 
-For local development or small-scale experiments, use the example block at the bottom of `h2_dispersion_gp.py`. For longer unattended runs, use:
+Training is controlled by `config_training.json`. Edit it to choose the trainer, model type, likelihood, hyperparameters, device, and output path. Then run:
 
 ```bash
-bash run_training.sh [optional_experiment_name]
+python h2_dispersion_gp.py
 ```
 
-Both read `data/unified_preprocessed.csv`, launch the training in the background, log progress to `logs/`, and write a summary to `experiments/`.
+or with a custom config file:
+
+```bash
+python h2_dispersion_gp.py --config my_config.json
+```
+
+#### Trainers
+
+The `trainer` field selects the training function:
+
+- `"approximate_additive"` (default): SVGP or VNNGP with the additive kernel. Requires the preprocessed dataset (`data/unified_preprocessed.csv`) with `time_since_release` and `h2_lag_1`.
+- `"exact"`: Standard Exact GP. Works with the raw dataset (`data/unified_raw.csv`) using `time`, `mass_flow`, `x`, `y`, `z`.
+
+#### Model / likelihood combinations
+
+For `approximate_additive` you can select:
+
+- `model_type`: `"SVGP"` or `"VNNGP"`
+- `likelihood_type`: `"gaussian"` or `"beta"`
+
+VNNGP with a Beta likelihood was used for the final model in the publication.
+
+#### Example `approximate_additive` config
+
+```json
+{
+  "data": {
+    "csv_path": "data/unified_preprocessed.csv"
+  },
+  "training": {
+    "trainer": "approximate_additive",
+    "model_type": "VNNGP",
+    "likelihood_type": "beta",
+    "n_inducing": 6000,
+    "k": 16,
+    "training_batch_size": 1024,
+    "n_epochs": 300,
+    "learning_rate": 0.008,
+    "device": "cuda:0",
+    "model_path": "models/approximate_indvAdditive_vnngp_rbf_k16_beta_300_lr8e-3.pth"
+  }
+}
+```
+
+#### Example `exact` config
+
+```json
+{
+  "data": {
+    "csv_path": "data/unified_raw.csv"
+  },
+  "training": {
+    "trainer": "exact",
+    "n_epochs": 200,
+    "learning_rate": 0.005,
+    "device": "cpu",
+    "model_path": "models/exact_gp.pth"
+  }
+}
+```
+
+#### Background training script
+
+`run_training.sh` is the author's personal unattended-training launcher and is listed in `.gitignore`. It is not part of the public reproducible workflow, but you can use it as a template for your own background-training wrapper if you wish.
 
 ## Dependencies
 
@@ -163,4 +226,13 @@ The repository includes `data_analysis.ipynb` and `kernel_analysis.ipynb` for ex
 
 ## License
 
-This repository is provided as a complement to the journal publication. Please cite the paper if you use the code or the open dataset in your own work.
+This repository is provided as a complement to the journal publication. Please cite the paper if you use the code in your own work. Please cite the dataset if you use the data in your own work:
+@data{USN.26117989_2025,
+author = {Henriksen Mathias and Fossum Hannibal E. and Åkervik Espen and Bjerketvedt Dag},
+publisher = {DataverseNO},
+title = {{Experimental Data of Hydrogen Dispersion in an Open-ended Rectangular Channel}},
+year = {2025},
+version = {V1},
+doi = {10.23642/USN.26117989},
+url = {https://doi.org/10.23642/USN.26117989}
+}
