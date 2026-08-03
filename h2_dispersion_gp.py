@@ -9,8 +9,7 @@ Training:
 - INPUT: time, mass_flow, y, z (from CFD + experiments)
 - OUTPUT: h2_concentration
 """
-"""import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'"""
+
 
 import warnings
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
@@ -23,7 +22,7 @@ from gpytorch.variational.nearest_neighbor_variational_strategy import NNVariati
 from gpytorch.constraints import Interval
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, Optional
 import time as time_module
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -36,7 +35,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import additive kernels
-from additive_kernels import ScaleAdditiveKernel, FullAdditiveKernel
+from additive_kernels import KernelWeightedAdditiveKernel, SubsetWeightedAdditiveKernel
 
 # Epsilon for log-transform to avoid log(0)
 LOG_EPSILON = 1e-4
@@ -178,9 +177,11 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         else:
             self.mean_module = gpytorch.means.ConstantMean()
         
-        # additive kernel
-        #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
-        #self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
+        # implemented additive kernel
+        #self.covar_module = KernelWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=4)
+        #self.covar_module = SubsetWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # more output scale parameters and more interpretable
+        
+        # hand-crafted kernel based on subset-weighted additive kernel
         # 2d kernels
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
@@ -199,13 +200,11 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
         self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
-
         # 6d kernel (all dims including lag1)
         self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
-
-
+        # constant kernel
         self.constant = gpytorch.kernels.ConstantKernel()
-        
+        # sum
         self.covar_module = (self.mass_x + self.mass_y + self.mass_z +
                              self.x_y + self.x_z + 
                              self.y_z  + self.mass_x_y +
@@ -223,6 +222,7 @@ class ExactGPModel(gpytorch.models.ExactGP):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
 
+        # 2d kernels
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.keops.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
@@ -275,8 +275,11 @@ class VNNGP(gpytorch.models.ApproximateGP):
             self.mean_module = SourceMean()
         else:
             self.mean_module = gpytorch.means.ZeroMean()
-        #self.covar_module = FullAdditiveKernel(base_kernel_type='rbf', num_dims=4)
-        #self.covar_module = ScaleAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
+        # implemented kernels
+        #self.covar_module = KernelWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=4)
+        #self.covar_module = SubsetWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
+        
+        # hand-crafted kernels based on subset-weigthed kernel
         # 2d kernels
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
@@ -295,13 +298,11 @@ class VNNGP(gpytorch.models.ApproximateGP):
         self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
         self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
-
         # 6d kernel (all dims including lag1)
         self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=6, active_dims=(0,1,2,3,4,5)))
-
-
+        # constant kernel
         self.constant = gpytorch.kernels.ConstantKernel()
-        
+        # sum
         self.covar_module = (self.mass_x + self.mass_y + self.mass_z + self.mass_lag1 +
                              self.x_y + self.x_z + self.x_lag1 + self.y_z +
                              self.y_lag1 + self.z_lag1 + self.mass_x_y +
@@ -327,7 +328,7 @@ class VNNGP(gpytorch.models.ApproximateGP):
 
 def select_inducing_points(X_train, n_inducing=1000, method='kmeans'):
     """
-    Select inducing points using clustering or random sampling.
+    Select inducing points using clustering or random sampling used for SVGP.
     
     Args:
         X_train: Training inputs [n, d] (numpy array)
@@ -610,16 +611,18 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                        mass_flow_lengthscale_min: float = 0.1,
                                        use_source_mean: bool = False):
     """
-    Train Sparse Variational GP (Approximate GP) with inducing points.
+    Train Sparse Variational GP (SVGP) with inducing points or Variational Nearest Neighbor GP (VNNGP).
     
     This uses the SparseH2DispersionGP model which scales to larger datasets
-    using inducing points for variational approximation.
+    using inducing points for variational approximation or it uses VNNGP which scales also to larger datasets.
+
+    You can also select the type of likelihood that should be used: Gaussian or Beta likelihood.
     
     Args:
         df: Full dataframe with columns time, mass_flow, y, z, h2_volume_fraction, split, scenario
         split_ratio: Fraction of training scenarios to use for validation
         n_inducing: Number of inducing points (fewer = faster but less accurate)
-        k: Number of nearest neighbors for VNNGP
+        k: Number of nearest neighbors for VNNGP (fewer = faster but less accurate)
         training_batch_size: Training batch size for VNNGP
         model_type: 'SVGP' or 'VNNGP'
         likelihood_type: 'gaussian' or 'beta'
@@ -1409,41 +1412,10 @@ def load_model(checkpoint_path, device='cpu'):
 if __name__ == "__main__":
     
     # Load data
-    df = pd.read_csv('/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model/data/unified_raw_two_modes.csv')
-    
-    # Sensor positions (should match your data)
-    SENSOR_POSITIONS = {
-        1: (0.77, 0.24, 0.8), 2: (0.46, 0.0, 0.8), 3: (0.48, 0.25, 0.52),
-        4: (0.13, 0.26, 0.8), 5: (0.48, 1.33, 0.52), 6: (0.46, 1.11, 0.8),
-        7: (0.9, 2.22, 0.8), 8: (0.47, 2.46, 0.52), 9: (0.46, 2.22, 0.8),
-        10: (0.74, 2.45, 0.8), 11: (0.15, 2.44, 0.8), 12: (0.00, 2.22, 0.8),
-        13: (0.47, 3.54, 0.52), 14: (0.46, 3.31, 0.8), 15: (0.78, 4.65, 0.8),
-        17: (0.46, 4.39, 0.8), 18: (0.47, 4.63, 0.52), 19: (0.14, 4.68, 0.52),
-        20: (0.75, 0.24, 0.0), 21: (0.45, 0.0, 0.0), 22: (0.16, 0.24, 0.0),
-        23: (0.47, 0.24, 0.28), 24: (0.46, 1.33, 0.27), 25: (0.47, 1.1, 0.0),
-        26: (0.46, 2.46, 0.27), 27: (0.47, 2.23, 0.0), 28: (0.47, 3.56, 0.27),
-        29: (0.47, 4.63, 0.27), 30: (0.46, 4.44, 0.0),
-    }
+    df = pd.read_csv('data/unified_preprocessed.csv')
     
     # Train on training set only
     print("\nTraining GP model...")
-    """model, likelihood, history = train_h2_dispersion_gp(
-        df,
-        split_ratio=0.8,
-        n_epochs=5,
-        learning_rate=0.1,
-        device='cuda:0',
-        model_path='models/exact_gp.pth'
-    )"""
-
-    """model, likelihood, history = train_h2_dispersion_gp_additive(
-        df_train=df_train,
-        n_epochs=100,
-        learning_rate=0.1,
-        device='cuda',
-        logger=logger,
-        model_path='models/additive_gp.pth'
-    )"""
 
     model, likelihood, history = train_h2_dispersion_gp_approximate_additive(
         df=df,
@@ -1456,6 +1428,6 @@ if __name__ == "__main__":
         n_epochs=300,
         learning_rate=0.008,
         device='cuda:0',
-        model_path='models/approximate_indvAdditive_vnngp_rbf_k16_beta_two_modes_300_lr8e-3.pth',
+        model_path='models/approximate_indvAdditive_vnngp_rbf_k16_beta_300_lr8e-3.pth',
         trained_model=None
     )
