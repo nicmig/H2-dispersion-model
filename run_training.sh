@@ -11,6 +11,7 @@ K="K128"
 EXPERIMENT_NAME="${1:-experiment_${MODEL_TYPE}_${K}_${LIKELIHOOD_TYPE}_$TIMESTAMP}"
 LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
 SUMMARY_FILE="$EXPERIMENT_DIR/${EXPERIMENT_NAME}_summary.txt"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Create directories
 mkdir -p "$LOG_DIR"
@@ -34,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, '/home/niclasflehmig/VisualCodeProjects/H2-dispersion-model')
+sys.path.insert(0, '$PROJECT_DIR')
 
 # Import your training module
 import torch
@@ -97,7 +98,7 @@ def main():
         
         # Load data
         print("Loading data...")
-        df = pd.read_csv('data/unified_raw_two_modes.csv')
+        df = pd.read_csv('data/unified_preprocessed.csv')
         print(f"Loaded {len(df)} rows")
         print(f"Mass flow range: {df['mass_flow'].min():.4f} - {df['mass_flow'].max():.4f}")
         print(f"Time range: {df['time'].min():.1f} - {df['time'].max():.1f}")
