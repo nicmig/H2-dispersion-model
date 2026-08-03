@@ -116,7 +116,7 @@ The preprocessed dataset contains `time_since_release`, `t_release`, and `h2_lag
 ### 2. Train the Stage 1 mass-flow estimator
 
 ```bash
-python run_stage1_massflow_estimator.py
+python massflow_estimator.py
 ```
 
 This reads `data/unified_preprocessed.csv` and trains the MLP ensemble used for early-time leakage-rate estimation.
