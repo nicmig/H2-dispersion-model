@@ -227,6 +227,8 @@ The repository includes `data_analysis.ipynb` and `kernel_analysis.ipynb` for ex
 ## License
 
 This repository is provided as a complement to the journal publication. Please cite the paper if you use the code in your own work. Please cite the dataset if you use the data in your own work:
+
+```
 @data{USN.26117989_2025,
 author = {Henriksen Mathias and Fossum Hannibal E. and Åkervik Espen and Bjerketvedt Dag},
 publisher = {DataverseNO},
@@ -236,3 +238,4 @@ version = {V1},
 doi = {10.23642/USN.26117989},
 url = {https://doi.org/10.23642/USN.26117989}
 }
+```

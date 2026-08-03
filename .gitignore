@@ -5,6 +5,4 @@
 /__pycache__
 /experiments
 /logs
-AGENTS.md
-BACKGROUND_TRAINING_GUIDE.md
 run_training.sh
