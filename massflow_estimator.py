@@ -3,8 +3,7 @@
 Stage 1: Early-time mass flow estimation using temporal features.
 
 Trains and evaluates:
-1. Random Forest on handcrafted features + temporal derivatives
-2. Improved MLP on log-transformed sensors + handcrafted features
+Improved MLP on log-transformed sensors + handcrafted features
 
 Uses leave-one-experiment-out cross-validation.
 """
@@ -20,7 +19,6 @@ from pathlib import Path
 import json
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from typing import Dict, Tuple, List, Optional
 
@@ -313,7 +311,7 @@ def main():
     device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    data_path = Path("data/unified_raw_two_modes_release_lag1.csv")
+    data_path = Path("data/unified_preprocessed.csv")
     if not data_path.exists():
         print(f"Error: {data_path} not found.")
         sys.exit(1)
