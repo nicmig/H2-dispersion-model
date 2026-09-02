@@ -295,34 +295,6 @@ def process_experiment(exp_file, exp_name):
     return all_records
 
 
-def shift_time_to_mass_flow_start(df, exp_name):
-    """Shift time so that time starts when mass flow starts."""
-    df = df.copy()
-    if exp_name in FORTY_SEC_START:
-        df = df[df['time'] >= 39]
-        t_min = df['time'].min()
-        df['time'] = df['time'] - t_min
-    else:
-        df = df[df['time'] >= 35]
-        t_min = df['time'].min()
-        df['time'] = df['time'] - t_min
-    return df
-
-def cut_off_time(df, exp_name):
-    """Shift time so that time starts when mass flow starts."""
-    df = df.copy()
-    if exp_name in THIRTY_SEC:
-        df = df[df['time'] <= 30]
-    elif exp_name in SIXTY_SEC:
-        df = df[df['time'] <= 60]
-    elif exp_name in NINETY_SEC:
-        df = df[df['time'] <= 90]
-    elif exp_name in HUNDRED_TWENTY_SEC:
-        df = df[df['time'] <= 120]
-    else:
-        df = df[df['time'] <= 240]
-    return df
-
 def assign_split(df, exp_name):
     """Assign train/val/test split based on experiment name."""
     if exp_name.startswith('CFD_'):
@@ -524,10 +496,6 @@ def main():
             logger.info(f"Processing {exp_name}...")
             df_exp = process_experiment(exp_file, exp_name)
             if not df_exp.empty:
-                if dataset_type == 'preprocessed':
-                    # Cut off the tail where the experiment has ended.
-                    # Release-onset alignment replaces the mass-flow-start shift.
-                    df_exp = cut_off_time(df_exp, exp_name)
                 df_exp['split'] = assign_split(df_exp, exp_name)
                 split_name = df_exp['split'].iloc[0]
                 all_data.append(df_exp)
@@ -575,6 +543,13 @@ def main():
         n_after_release = (df_all['time_since_release'] >= 0).sum()
         logger.info(f"  Records before release: {n_before_release:,}")
         logger.info(f"  Records at/after release: {n_after_release:,}")
+
+        # Keep only rows from the release onset onward; discard "dead" pre-release data
+        df_all = df_all[df_all['time_since_release'] >= 0].copy()
+        logger.info(
+            f"  Dropped {n_before_release:,} pre-release records; "
+            f"{len(df_all):,} records remain"
+        )
 
     # Save dataset
     output_file.parent.mkdir(parents=True, exist_ok=True)
