@@ -1,7 +1,7 @@
 {
   "data_sources": {
     "include_experiments": true,
-    "include_cfd": false
+    "include_cfd": true
   },
   "dataset_type": "raw",
   "release_onset": {
