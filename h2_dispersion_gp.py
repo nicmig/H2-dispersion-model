@@ -123,7 +123,7 @@ class SourceMean(gpytorch.means.Mean):
     """
     
     def __init__(self, source_loc=(0.45, 0.5, 0.8), spatial_lengthscale=0.2,
-                 time_decay=30.0):
+                 time_decay=200.0):
         super().__init__()
         self.register_buffer('source_loc',
                              torch.tensor(source_loc, dtype=torch.float64))
@@ -135,8 +135,7 @@ class SourceMean(gpytorch.means.Mean):
     def forward(self, x):
         # x[:, 2:5] corresponds to (x, y, z)
         spatial_dist_sq = ((x[:, 2:5] - self.source_loc) ** 2).sum(dim=-1)
-        spatial_term = torch.exp(-spatial_dist_sq /
-                                 (2 * self.spatial_lengthscale ** 2))
+        spatial_term = torch.exp(-spatial_dist_sq /(2 * self.spatial_lengthscale ** 2))
         # x[:, 0] corresponds to time_since_release
         time_term = torch.exp(-x[:, 0].abs() / self.time_decay)
         return self.amplitude * spatial_term * time_term

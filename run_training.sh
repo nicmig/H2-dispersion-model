@@ -5,9 +5,9 @@
 EXPERIMENT_DIR="experiments"
 LOG_DIR="logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-MODEL_TYPE="scaleAdditiveVNNGP"
-LIKELIHOOD_TYPE="Gaussian"
-K="K128"
+MODEL_TYPE="indvAdditiveSVGP"
+LIKELIHOOD_TYPE="Beta"
+K="4000"
 EXPERIMENT_NAME="${1:-experiment_${MODEL_TYPE}_${K}_${LIKELIHOOD_TYPE}_$TIMESTAMP}"
 LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
 SUMMARY_FILE="$EXPERIMENT_DIR/${EXPERIMENT_NAME}_summary.txt"
@@ -98,7 +98,11 @@ def main():
         
         # Load data
         print("Loading data...")
+<<<<<<< HEAD
         df = pd.read_csv('data/unified_preprocessed.csv')
+=======
+        df = pd.read_csv('data/unified_raw_two_modes_release_lag1.csv')
+>>>>>>> 6793900 (**)
         print(f"Loaded {len(df)} rows")
         print(f"Mass flow range: {df['mass_flow'].min():.4f} - {df['mass_flow'].max():.4f}")
         print(f"Time range: {df['time'].min():.1f} - {df['time'].max():.1f}")
@@ -107,19 +111,20 @@ def main():
         # Training configuration
         config = {
             'split_ratio': 0.2,
-            'n_inducing': 500,
-            'k': 128,
-            'training_batch_size': 256,
+            'n_inducing': 4000,
+            'k': 16,
+            'training_batch_size': 2048,
             'n_epochs': 300,
-            'learning_rate': 0.01,
-            'model_type': "VNNGP",
-            'likelihood_type': "gaussian",
+            'learning_rate': 0.009,
+            'model_type': "SVGP",
+            'use_source_mean': True,
+            'likelihood_type': "beta",
             'device': 'cuda:0',
-            'model_path': 'models/approximate_scaleAdditive_vnngp_rbf_k128_gaussian_two_modes.pth',
+            'model_path': 'models/approximate_indvAdditive_svgp_rbf_4000_beta_two_modes_lag_sourceAll_300_lr9e-3.pth',
             'trained_model': None,
             'val_every_n_epochs': 10,
             'early_stopping_patience': 50,
-            'mass_flow_lengthscale_min': 0.1
+            'mass_flow_lengthscale_min': 0.001
         }
         
         print("Training configuration:")
@@ -232,7 +237,7 @@ sed -i "s|LOG_FILE_PLACEHOLDER|$LOG_FILE|g" /tmp/run_training_${TIMESTAMP}.py
 (
     source venv/bin/activate
     
-    export CUDA_VISIBLE_DEVICES=0
+    export CUDA_VISIBLE_DEVICES=1
     # Run training with unbuffered output
     python3 -u /tmp/run_training_${TIMESTAMP}.py 2>&1 | tee "$LOG_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
