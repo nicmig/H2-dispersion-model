@@ -98,11 +98,7 @@ def main():
         
         # Load data
         print("Loading data...")
-<<<<<<< HEAD
         df = pd.read_csv('data/unified_preprocessed.csv')
-=======
-        df = pd.read_csv('data/unified_raw_two_modes_release_lag1.csv')
->>>>>>> 6793900 (**)
         print(f"Loaded {len(df)} rows")
         print(f"Mass flow range: {df['mass_flow'].min():.4f} - {df['mass_flow'].max():.4f}")
         print(f"Time range: {df['time'].min():.1f} - {df['time'].max():.1f}")
