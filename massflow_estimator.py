@@ -9,6 +9,8 @@ Uses leave-one-experiment-out cross-validation.
 """
 
 import sys
+import json
+import pickle
 import numpy as np
 import pandas as pd
 import torch
@@ -16,13 +18,16 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 from pathlib import Path
-import json
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 
-from early_time_features import build_dataset_temporal, ALL_FEATURE_NAMES
+from early_time_features import build_dataset_temporal
+from build_dataset import HELD_OUT_TEST_EXPERIMENTS
+
+# Default path for the saved final ensemble
+ENSEMBLE_PATH = Path("models/stage1_ensemble.pth")
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +252,100 @@ def loeo_cv_torch(
 
 
 # ---------------------------------------------------------------------------
+# Final ensemble: trained on all non-test experiments and saved to disk
+# ---------------------------------------------------------------------------
+
+def train_final_ensemble(
+    X: np.ndarray,
+    y: np.ndarray,
+    exp_ids: np.ndarray,
+    n_ensemble: int = 7,
+    n_epochs: int = 300,
+    batch_size: int = 32,
+    lr: float = 5e-4,
+    weight_decay: float = 5e-4,
+    patience: int = 50,
+    loss_type: str = "mae",
+    val_fraction: float = 0.15,
+    seed: int = 0,
+    device: str = "cuda:0" if torch.cuda.is_available() else "cpu",
+    verbose: bool = True,
+) -> Dict:
+    """Train the final ensemble on all experiments except the held-out test set.
+
+    A small random subset of the training experiments is held out for early
+    stopping (the LOEO evaluation used the CV fold for this).
+
+    Returns a dict with the fitted 'scaler', the member 'state_dicts', and
+    'input_dim'.
+    """
+    mask_test = np.isin(exp_ids, HELD_OUT_TEST_EXPERIMENTS)
+    X, y, exp_ids = X[~mask_test], y[~mask_test], exp_ids[~mask_test]
+
+    rng = np.random.default_rng(seed)
+    unique_exps = np.unique(exp_ids)
+    n_val = max(1, int(round(val_fraction * len(unique_exps))))
+    val_exps = rng.choice(unique_exps, size=n_val, replace=False)
+    mask_val = np.isin(exp_ids, val_exps)
+    mask_tr = ~mask_val
+    if verbose:
+        print(f"Final ensemble: {mask_tr.sum()} train / {mask_val.sum()} val samples "
+              f"({len(unique_exps)} experiments, val: {sorted(map(str, val_exps))})")
+
+    scaler = StandardScaler()
+    X_tr = scaler.fit_transform(X[mask_tr])
+    X_val = scaler.transform(X[mask_val])
+    sample_weights = compute_sample_weights(y[mask_tr])
+
+    state_dicts = []
+    for ens_idx in range(n_ensemble):
+        torch.manual_seed(42 + ens_idx)
+        train_ds = TensorDataset(
+            torch.from_numpy(X_tr).float(),
+            torch.from_numpy(y[mask_tr]).float(),
+        )
+        val_ds = TensorDataset(
+            torch.from_numpy(X_val).float(),
+            torch.from_numpy(y[mask_val]).float(),
+        )
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+        model = ImprovedMLP(input_dim=X.shape[1], dropout=0.2)
+        model, history = train_torch_model(
+            model, train_loader, val_loader,
+            sample_weights=sample_weights,
+            n_epochs=n_epochs, lr=lr, weight_decay=weight_decay,
+            patience=patience, loss_type=loss_type, device=device,
+        )
+        state_dicts.append({k: v.cpu() for k, v in model.state_dict().items()})
+        if verbose:
+            print(f"  member {ens_idx + 1}/{n_ensemble}: "
+                  f"{len(history['train_loss'])} epochs, best val loss {min(history['val_loss']):.4f}")
+
+    return {"scaler": scaler, "state_dicts": state_dicts, "input_dim": X.shape[1]}
+
+
+def save_ensemble(ensemble: Dict, path: Path = ENSEMBLE_PATH):
+    """Save the final ensemble (member state dicts + fitted scaler) to disk."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "scaler": pickle.dumps(ensemble["scaler"]),
+        "state_dicts": ensemble["state_dicts"],
+        "input_dim": ensemble["input_dim"],
+    }, path)
+    print(f"Saved Stage 1 ensemble to {path}")
+
+
+def load_ensemble(path: Path = ENSEMBLE_PATH) -> Dict:
+    """Load an ensemble saved with save_ensemble."""
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    blob["scaler"] = pickle.loads(blob["scaler"])
+    return blob
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
@@ -259,11 +358,11 @@ def plot_results(results_mlp: Dict, save_path: Path):
     ax = axes[0]
     ax.scatter(results_mlp["y_true"], results_mlp["y_pred"], alpha=0.4, s=15, c="green", label=f"MLP (MAE={results_mlp['overall']['MAE']:.3f})")
     ax.plot([axmin, axmax], [axmin, axmax], "k--", lw=2)
-    ax.set_xlabel("True Mass Flow (g/s)", fontsize=18)
-    ax.set_ylabel("Predicted Mass Flow (g/s)", fontsize=18)
-    ax.set_title("MLP: Predicted vs True Mass Flow", fontsize=20)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("True Leakage Rate (g/s)", fontsize=18)
+    ax.set_ylabel("Predicted Leakage Rate (g/s)", fontsize=18)
+    ax.set_title("MLP: Predicted vs True Leakage Rate", fontsize=20)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.7)
 
     # Panel 2: Per-experiment MAE
     ax = axes[1]
@@ -276,7 +375,7 @@ def plot_results(results_mlp: Dict, save_path: Path):
     ax.set_xticklabels(exp_names, rotation=45, ha="right", fontsize=5)
     ax.set_ylabel("MAE (g/s)", fontsize=18)
     ax.set_title("Per-Experiment MAE", fontsize=20)
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.grid(True, alpha=0.7, axis="y")
 
     # Panel 3: MLP scatter zoomed
     """ax = axes[1, 0]
@@ -295,11 +394,11 @@ def plot_results(results_mlp: Dict, save_path: Path):
     ax.set_xlabel("Prediction Error (g/s)", fontsize=18)
     ax.set_ylabel("Count", fontsize=18)
     ax.set_title("Error Distribution", fontsize=20)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.7, axis="y")
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
+    plt.savefig(save_path)
     print(f"Saved plot to {save_path}")
 
 
@@ -311,7 +410,7 @@ def main():
     device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    data_path = Path("data/unified_preprocessed.csv")
+    data_path = Path("data/unified_preprocessed_9e-3.csv")
     if not data_path.exists():
         print(f"Error: {data_path} not found.")
         sys.exit(1)
@@ -350,7 +449,7 @@ def main():
     # ------------------------------------------------------------------
     viz_dir = Path("validation_viz")
     viz_dir.mkdir(exist_ok=True)
-    plot_path = viz_dir / "stage1_massflow_estimator.png"
+    plot_path = viz_dir / "stage1_massflow_estimator.pdf"
     plot_results(results_mlp, plot_path)
 
     # ------------------------------------------------------------------
@@ -368,6 +467,13 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nSaved summary to {summary_path}")
+
+    # ------------------------------------------------------------------
+    # Train and save the final ensemble (all non-test experiments)
+    # ------------------------------------------------------------------
+    print("\nTraining final ensemble on all non-test experiments...")
+    ensemble = train_final_ensemble(X_combined, y, exp_ids, n_ensemble=7, device=device)
+    save_ensemble(ensemble)
     print("Done!")
 
 

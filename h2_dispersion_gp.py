@@ -1,13 +1,9 @@
 """
 GP for H2 Dispersion Prediction
 
-During operation:
-- INPUT: time, sensor observations {sensor_id: h2_concentration}
-- OUTPUT: concentration field prediction + uncertainty
-
-Training:
-- INPUT: time, mass_flow, y, z (from CFD + experiments)
+- INPUT: time, mass_flow, x, y, z
 - OUTPUT: h2_concentration
+
 """
 
 
@@ -19,7 +15,6 @@ import torch
 torch.cuda.empty_cache()
 import gpytorch
 from gpytorch.variational.nearest_neighbor_variational_strategy import NNVariationalStrategy
-from gpytorch.constraints import Interval
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional
@@ -28,7 +23,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import json
 import argparse
-import sys
 from datetime import datetime
 from tqdm import tqdm
 
@@ -113,34 +107,6 @@ class ExperimentLogger:
         return self.log_file
 
 
-class SourceMean(gpytorch.means.Mean):
-    """
-    Mean function that peaks at the fixed H2 release location and decays
-    spatially and temporally. Helps anchor early-time predictions to the source.
-    
-    Assumes input order:
-        [time_since_release, mass_flow, x, y, z, ...]
-    """
-    
-    def __init__(self, source_loc=(0.45, 0.5, 0.8), spatial_lengthscale=0.2,
-                 time_decay=200.0):
-        super().__init__()
-        self.register_buffer('source_loc',
-                             torch.tensor(source_loc, dtype=torch.float64))
-        self.spatial_lengthscale = spatial_lengthscale
-        self.time_decay = time_decay
-        # Learnable amplitude (optimized during training)
-        self.amplitude = torch.nn.Parameter(torch.tensor(0.1, dtype=torch.float64))
-    
-    def forward(self, x):
-        # x[:, 2:5] corresponds to (x, y, z)
-        spatial_dist_sq = ((x[:, 2:5] - self.source_loc) ** 2).sum(dim=-1)
-        spatial_term = torch.exp(-spatial_dist_sq /(2 * self.spatial_lengthscale ** 2))
-        # x[:, 0] corresponds to time_since_release
-        time_term = torch.exp(-x[:, 0].abs() / self.time_decay)
-        return self.amplitude * spatial_term * time_term
-
-
 class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
     """
     Sparse Variational GP for H2 dispersion.
@@ -148,20 +114,17 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
     Uses inducing points to approximate the full GP posterior.
     Scales to large datasets (O(m²n) instead of O(n³)).
     
-    GP model: f(time_since_release, mass_flow, x, y, z, h2_lag_1) -> h2_concentration
+    GP model: f(time_since_release, mass_flow, x_rel, y_rel, z_rel) -> h2_concentration
     """
     
-    def __init__(self, inducing_points, lengthscale_constraints=None,
-                 use_source_mean=False):
+    def __init__(self, inducing_points):
         """
         Args:
             inducing_points: Initial inducing point locations [n_inducing, n_features]
-            lengthscale_constraints: Optional constraints on kernel lengthscales
-            use_source_mean: If True, use SourceMean peaked at the release location.
-                             If False, use ConstantMean.
         """
         # Variational distribution q(u)
         variational_dist = gpytorch.variational.CholeskyVariationalDistribution(num_inducing_points=inducing_points.size(0))
+
         
         # Variational strategy
         variational_strategy = gpytorch.variational.VariationalStrategy(
@@ -172,28 +135,21 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         )
         
         super().__init__(variational_strategy)
-        
-        if use_source_mean:
-            self.mean_module = SourceMean()
-        else:
-            self.mean_module = gpytorch.means.ConstantMean()
+
+        self.mean_module = gpytorch.means.ZeroMean()
         
         # implemented additive kernel
         #self.covar_module = KernelWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=4)
-        #self.covar_module = SubsetWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # more output scale parameters and more interpretable
+        #self.covar_module = SubsetWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=5) # more output scale parameters and more interpretable
         
         # hand-crafted kernel based on subset-weighted additive kernel
         # 2d kernels
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
-        #self.mass_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,5)))
         self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
         self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
-        #self.x_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,5)))
         self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
-        #self.y_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,5)))
-        #self.z_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(4,5)))
         # 3d kernels
         self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
         self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
@@ -201,12 +157,12 @@ class SparseH2DispersionGP(gpytorch.models.ApproximateGP):
         self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
         self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
-        # 6d kernel (all dims including lag1)
+        # 5d kernel
         self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
         # constant kernel
         self.constant = gpytorch.kernels.ConstantKernel()
         # sum
-        self.covar_module = (self.mass_x + self.mass_y + self.mass_z +
+        self.covar_module = (self.mass_x + self.mass_y + self.mass_z + 
                              self.x_y + self.x_z + 
                              self.y_z  + self.mass_x_y +
                              self.mass_x_z + self.mass_y_z + self.x_y_z +
@@ -250,17 +206,13 @@ class ExactGPModel(gpytorch.models.ExactGP):
 
 
 class VNNGP(gpytorch.models.ApproximateGP):
-    def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256,
-                 lengthscale_constraints=None, use_source_mean=False):
+    def __init__(self, inducing_points, likelihood, k=256, training_batch_size=256):
         """
         Args:
             inducing_points: Initial inducing point locations [n_inducing, n_features]
             likelihood: GPyTorch likelihood
             k: Number of nearest neighbors for VNNGP
             training_batch_size: Batch size for nearest neighbor search
-            lengthscale_constraints: Optional constraints on kernel lengthscales
-            use_source_mean: If True, use SourceMean peaked at the release location.
-                             If False, use ZeroMean.
         """
 
         m, d = inducing_points.shape
@@ -272,10 +224,7 @@ class VNNGP(gpytorch.models.ApproximateGP):
         variational_strategy = NNVariationalStrategy(self, inducing_points, variational_distribution, k=k, training_batch_size=training_batch_size, jitter_val=0.0001)
 
         super(VNNGP, self).__init__(variational_strategy)
-        if use_source_mean:
-            self.mean_module = SourceMean()
-        else:
-            self.mean_module = gpytorch.means.ZeroMean()
+        self.mean_module = gpytorch.means.ConstantMean()
         # implemented kernels
         #self.covar_module = KernelWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=4)
         #self.covar_module = SubsetWeightedAdditiveKernel(base_kernel_type='rbf', num_dims=5,lengthscale_constraints=lengthscale_constraints) # less output scale parameters and more interpretable
@@ -285,13 +234,9 @@ class VNNGP(gpytorch.models.ApproximateGP):
         self.mass_x = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,2)))
         self.mass_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,3)))
         self.mass_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,4)))
-        self.mass_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(1,5)))
         self.x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,3)))
         self.x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,4)))
-        self.x_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(2,5)))
         self.y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,4)))
-        self.y_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(3,5)))
-        self.z_lag1 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=2, active_dims=(4,5)))
         # 3d kernels
         self.mass_x_y = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,3)))
         self.mass_x_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(1,2,4)))
@@ -299,14 +244,13 @@ class VNNGP(gpytorch.models.ApproximateGP):
         self.x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=3, active_dims=(2,3,4)))
         # 4d kernel
         self.mass_x_y_z = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=4, active_dims=(1,2,3,4)))
-        # 6d kernel (all dims including lag1)
-        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=6, active_dims=(0,1,2,3,4,5)))
+        # 5d kernel
+        self.all = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=5, active_dims=(0,1,2,3,4)))
         # constant kernel
         self.constant = gpytorch.kernels.ConstantKernel()
         # sum
-        self.covar_module = (self.mass_x + self.mass_y + self.mass_z + self.mass_lag1 +
-                             self.x_y + self.x_z + self.x_lag1 + self.y_z +
-                             self.y_lag1 + self.z_lag1 + self.mass_x_y +
+        self.covar_module = (self.mass_x + self.mass_y + self.mass_z + 
+                             self.x_y + self.x_z  + self.y_z + self.mass_x_y +
                              self.mass_x_z + self.mass_y_z + self.x_y_z +
                              self.mass_x_y_z + self.all + self.constant)
 
@@ -363,7 +307,7 @@ def select_inducing_points(X_train, n_inducing=1000, method='kmeans'):
     return inducing_points
 
 
-def train_h2_dispersion_gp(df,
+def train_exact_h2_dispersion_gp(df,
                            split_ratio=0.2,
                            n_epochs: int = 200,
                            learning_rate: float = 0.005,
@@ -377,7 +321,7 @@ def train_h2_dispersion_gp(df,
     overfit, so we train for fixed epochs and evaluate at the end.
     
     Args:
-        df_train: Training dataframe with columns time, mass_flow, y, z, h2_volume_fraction
+        df_train: Training dataframe with columns time, mass_flow, x, y, z, h2_volume_fraction
         n_epochs: Number of training epochs
         learning_rate: Learning rate for Adam optimizer
         device: 'cpu' or 'cuda'
@@ -410,6 +354,7 @@ def train_h2_dispersion_gp(df,
     y = df_train['h2_volume_fraction'].values
     
     # Scale inputs and log-transform target
+    # We need to scale targets so that they have a Gaussian-like shape since we can only use Gaussian Likelihood for exact GPs
     x_scaler = StandardScaler()
     y_scaler = StandardScaler()
     X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
@@ -504,8 +449,7 @@ def train_h2_dispersion_gp(df,
     return model, likelihood, history
 
 
-def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
-                        likelihood_type='gaussian'):
+def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None, likelihood_type='gaussian'):
     """
     Evaluate model on validation set and return MAE, RMSE.
     
@@ -516,7 +460,6 @@ def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
         y_val_t: Validation targets tensor
         y_scaler: StandardScaler for inverse-transforming targets (gaussian only)
         likelihood_type: 'gaussian' or 'beta'
-        log_epsilon: Epsilon for log-transform inverse
     
     Returns:
         mae, rmse
@@ -525,7 +468,7 @@ def evaluate_validation(model, likelihood, val_loader, y_val_t, y_scaler=None,
     likelihood.eval()
     means = torch.tensor([0.])
     with torch.no_grad():
-        for x_batch, y_batch in val_loader:
+        for x_batch, _ in val_loader:
             preds = likelihood(model(x_batch))
             pred_mean = preds.mean.cpu()
             # Non-Gaussian likelihoods (e.g., Beta) use MC sampling and return
@@ -608,9 +551,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                        model_path: Optional[str] = None,
                                        trained_model: Optional[str] = None,
                                        val_every_n_epochs: int = 10,
-                                       early_stopping_patience: int = 50,
-                                       mass_flow_lengthscale_min: float = 0.1,
-                                       use_source_mean: bool = False):
+                                       early_stopping_patience: int = 50):
     """
     Train Sparse Variational GP (SVGP) with inducing points or Variational Nearest Neighbor GP (VNNGP).
     
@@ -620,7 +561,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
     You can also select the type of likelihood that should be used: Gaussian or Beta likelihood.
     
     Args:
-        df: Full dataframe with columns time, mass_flow, y, z, h2_volume_fraction, split, scenario
+        df: Full dataframe with columns time, mass_flow, x_rel, y_rel, z_rel, h2_volume_fraction, split, scenario
         split_ratio: Fraction of training scenarios to use for validation
         n_inducing: Number of inducing points (fewer = faster but less accurate)
         k: Number of nearest neighbors for VNNGP (fewer = faster but less accurate)
@@ -633,9 +574,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         model_path: Optional path to save model
         trained_model: Optional path to load pre-trained model
         val_every_n_epochs: Evaluate validation metrics every N epochs
-        early_stopping_patience: Stop if validation RMSE doesn't improve for this many epochs
-        mass_flow_lengthscale_min: Minimum lengthscale for mass_flow dimension (prevents collapse)
-    
+        early_stopping_patience: Stop if validation RMSE doesn't improve for this many epochs  
     Returns:
         model, likelihood, history: Trained model, likelihood, and training history
     """
@@ -669,8 +608,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
     if likelihood_type == "gaussian":
         x_scaler = StandardScaler()
         y_scaler = StandardScaler()
-        #X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
-        X = df_train[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
+        X = df_train[['time_since_release', 'mass_flow', 'x', 'y', 'z']].values
         x_scaler.fit(X)
         x_scaled = x_scaler.transform(X)
         y = df_train['h2_volume_fraction'].values
@@ -685,8 +623,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
-        #X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
-        X_val = df_val[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
+        X_val = df_val[['time_since_release', 'mass_flow', 'x', 'y', 'z']].values
         x_val_scaled = x_scaler.transform(X_val)
         y_val = df_val['h2_volume_fraction'].values
         y_val_log = np.log(y_val + LOG_EPSILON)
@@ -699,14 +636,12 @@ def train_h2_dispersion_gp_approximate_additive(df,
         val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
-        #print(f"Input dimensions: mass_flow, x,  y, z")
-        print(f"Target: log(y)")
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().double().to(device)
-    elif likelihood_type == 'beta':
+    # use beta likelihood since we regress percentage
+    elif likelihood_type == 'beta': 
         x_scaler = StandardScaler()
-        #X = df_train[['time', 'mass_flow', 'x', 'y', 'z']].values
-        X = df_train[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
+        X = df_train[['time_since_release', 'mass_flow', 'x_rel', 'y_rel', 'z_rel']].values
         x_scaler.fit(X)
         x_scaled = x_scaler.transform(X)
         y = df_train['h2_volume_fraction'].values
@@ -718,8 +653,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         train_loader = DataLoader(train_dataset, batch_size=training_batch_size, shuffle=True)
 
         # Prepare validation data
-        #X_val = df_val[['time', 'mass_flow', 'x', 'y', 'z']].values
-        X_val = df_val[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
+        X_val = df_val[['time_since_release', 'mass_flow', 'x_rel', 'y_rel', 'z_rel']].values
         x_val_scaled = x_scaler.transform(X_val)
         y_val = df_val['h2_volume_fraction'].values
 
@@ -727,10 +661,9 @@ def train_h2_dispersion_gp_approximate_additive(df,
         y_val_t = torch.tensor(y_val, dtype=torch.float64, device=device).contiguous()
 
         val_dataset = TensorDataset(X_val_t, y_val_t.squeeze())
-        val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
         
         print(f"\nTraining data: {len(x_train):,} points")
-        #print(f"Input dimensions: time, mass_flow, x, y, z")
 
         likelihood = gpytorch.likelihoods.BetaLikelihood().double().to(device)
     else:
@@ -746,23 +679,22 @@ def train_h2_dispersion_gp_approximate_additive(df,
         'learning_rate': learning_rate,
         'device': device,
         'model_type': model_type,
-        'likelihood_type': likelihood_type,
-        'use_source_mean': use_source_mean
+        'likelihood_type': likelihood_type
     })
     
     if model_type == "SVGP":
         # Select inducing points using k-means
         inducing_points = select_inducing_points(X, n_inducing=n_inducing, method='kmeans')
-        inducing_points = inducing_points.to(device) 
-        model = SparseH2DispersionGP(inducing_points=inducing_points,
-                                      use_source_mean=use_source_mean).double().to(device)
+        inducing_points = inducing_points.to(device)
+        model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
         model.train()
         likelihood.train()
         optimizer = torch.optim.AdamW([{'params' : model.parameters()}, {'params': likelihood.parameters()}], lr=learning_rate)
 
-        print(f"\nModel: SparseH2DispersionGP (Approximate GP)")
+        print(f"\nModel: SVGP (Approximate GP)")
         print(f"Variational parameters: {n_inducing} inducing points")
 
+        # Select one loss function
         #mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=len(X_train))
         mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
         
@@ -793,7 +725,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
         for epoch in iterator:
             loss_epoch = 0.
             minibatch_iter = tqdm(train_loader, desc="Minibatch", leave=False)
-            with gpytorch.settings.cholesky_jitter():
+            with gpytorch.settings.cholesky_jitter(1e-4):
                 for x_batch, y_batch in minibatch_iter:
                     optimizer.zero_grad()
                     output = model(x_batch)
@@ -803,7 +735,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                     loss_epoch += loss_train
                     loss.backward()
                     optimizer.step()
-
+                    
             epoch_loss = float(loss_epoch) / float(len(minibatch_iter))    
             iterator.set_postfix(epoch_loss=f"{epoch_loss:.4f}")
             history['train_epoch_loss'].append(epoch_loss)
@@ -845,9 +777,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                 'k': k,
                                 'training_batch_size': training_batch_size,
                                 'n_inducing': n_inducing,
-                                'likelihood_type': likelihood_type,
-                                'lengthscale_constraints': None,
-                                'use_source_mean': use_source_mean
+                                'likelihood_type': likelihood_type
                             }
                         )
                 else:
@@ -871,9 +801,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                         'k': k,
                         'training_batch_size': training_batch_size,
                         'n_inducing': n_inducing,
-                        'likelihood_type': likelihood_type,
-                        'lengthscale_constraints': None,  # Not serializable; stored in model state
-                        'use_source_mean': use_source_mean
+                        'likelihood_type': likelihood_type
                     }
                 )
         
@@ -891,37 +819,20 @@ def train_h2_dispersion_gp_approximate_additive(df,
         training_batch_size = training_batch_size
         y_train = y_train.squeeze()
         
-        # Build lengthscale constraints: mass_flow (dim 1) gets lower bound
-        lengthscale_constraints = [None, None, None, None]
-        if mass_flow_lengthscale_min > 0:
-            lengthscale_constraints[1] = Interval(
-                lower_bound=mass_flow_lengthscale_min,
-                upper_bound=10.0,
-                initial_value=1.0
-            )
-            print(f"\nMass flow lengthscale constraint: [{mass_flow_lengthscale_min}, 10.0]")
-        
         # Select inducing points as subset of training data
         if trained_model is not None:
             print("Use pre-trained model.")
             checkpoint = torch.load(trained_model, map_location=device)
             # Use saved inducing points
             inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points']
-            model = VNNGP(
-                inducing_points=inducing_points, likelihood=likelihood,
-                k=k, training_batch_size=training_batch_size,
-                lengthscale_constraints=lengthscale_constraints,
-                use_source_mean=use_source_mean
-            ).double().to(device)
+            model = VNNGP(inducing_points=inducing_points, likelihood=likelihood, k=k, training_batch_size=training_batch_size).double().to(device)
             model.load_state_dict(checkpoint['model_state_dict'])
             likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
         else:
             torch.cuda.set_device(device)
             model = VNNGP(
                 inducing_points=x_train, likelihood=likelihood,
-                k=k, training_batch_size=training_batch_size,
-                lengthscale_constraints=lengthscale_constraints,
-                use_source_mean=use_source_mean
+                k=k, training_batch_size=training_batch_size
             ).double().to(device)
         num_batches = model.variational_strategy._total_training_batches
         model.train()
@@ -930,6 +841,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
     
         print(f"\nModel: VNNGP (Approximate GP)")
 
+        # Select loss function
         #mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=y_train.size(0))
         mll = gpytorch.mlls.PredictiveLogLikelihood(likelihood, model, num_data=y_train.size(0))
 
@@ -1013,8 +925,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                                 'k': k,
                                 'training_batch_size': training_batch_size,
                                 'n_inducing': n_inducing,
-                                'likelihood_type': likelihood_type,
-                                'use_source_mean': use_source_mean
+                                'likelihood_type': likelihood_type
                             }
                         )
                 else:
@@ -1038,8 +949,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                         'k': k,
                         'training_batch_size': training_batch_size,
                         'n_inducing': n_inducing,
-                        'likelihood_type': likelihood_type,
-                        'use_source_mean': use_source_mean
+                        'likelihood_type': likelihood_type
                     }
                 )
         
@@ -1082,8 +992,7 @@ def train_h2_dispersion_gp_approximate_additive(df,
                 'k': k,
                 'training_batch_size': training_batch_size,
                 'n_inducing': n_inducing,
-                'likelihood_type': likelihood_type,
-                'use_source_mean': use_source_mean
+                'likelihood_type': likelihood_type
             }
         )
 
@@ -1097,7 +1006,10 @@ def train_h2_dispersion_gp_approximate_additive(df,
     plt.grid(True, linestyle='--', alpha=0.4)
     plt.legend()
     plt.tight_layout()
-    fig_name = model_type + str(k)
+    if model_type == "SVGP":
+        fig_name = model_type + str(n_inducing)
+    else:
+        fig_name = model_type + str(k)
     plt.savefig(fig_name)
 
     print(f"Final Validation MAE: {final_mae:.4f}")
@@ -1179,7 +1091,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     Evaluate trained GP model on test set.
     
     This should only be called for the final selected model (best on validation).
-    Returns comprehensive metrics including MAE, RMSE, R².
+    Returns comprehensive metrics including MAE, RMSE.
     
     Args:
         model: Trained GP model
@@ -1190,7 +1102,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
         y_scaler: StandardScaler for log-targets (if used during training)
     
     Returns:
-        metrics: Dict with 'mae', 'rmse', 'r2', 'nll', 'predictions', 'targets'
+        metrics: Dict with 'mae', 'rmse', 'nll', 'predictions', 'targets'
     """
     print("\n" + "=" * 60)
     print("TEST EVALUATION")
@@ -1200,9 +1112,8 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
     is_beta = isinstance(likelihood, gpytorch.likelihoods.BetaLikelihood)
     is_vnngp = isinstance(model, VNNGP)
     
-    # Prepare test data
-    #X_test = df_test[['time', 'mass_flow', 'x', 'y', 'z']].values
-    X_test = df_test[['time_since_release', 'mass_flow', 'x', 'y', 'z', 'h2_lag_1']].values
+    # Prepare test data where the feature columns must match what the checkpoint was trained on
+    X_test = df_test[['time_since_release', 'mass_flow', 'x_rel', 'y_rel', 'z_rel']].values
     y_test = df_test['h2_volume_fraction'].values
     
     # Apply input scaling if scaler was used during training
@@ -1232,8 +1143,7 @@ def evaluate_gp_model(model, likelihood, df_test, device='cpu', x_scaler=None, y
         nll = -log_lik.mean().item()
         pred_mean = pred.mean
         pred_std = pred.stddev
-        # Non-Gaussian likelihoods (e.g., Beta) return (num_mc_samples, N).
-        # Average over MC samples to get the predictive mean and std.
+        # Non-Gaussian likelihoods (e.g., Beta) return (num_mc_samples, N) so average over MC samples to get the predictive mean and std.
         if pred_mean.dim() == 2:
             # Total variance: E[Var[y|f]] + Var[E[y|f]]
             pred_sample_means = pred_mean  # (num_mc_samples, N)
@@ -1366,16 +1276,12 @@ def load_model(checkpoint_path, device='cpu'):
         # Read hyperparameters from checkpoint, with sensible defaults
         k = hyperparams.get('k', 64)
         training_batch_size = hyperparams.get('training_batch_size', 1024)
-        lengthscale_constraints = hyperparams.get('lengthscale_constraints', None)
-        use_source_mean = hyperparams.get('use_source_mean', False)
         
         model = VNNGP(
             inducing_points=inducing_points,
             likelihood=likelihood,
             k=k,
-            training_batch_size=training_batch_size,
-            lengthscale_constraints=lengthscale_constraints,
-            use_source_mean=use_source_mean
+            training_batch_size=training_batch_size
         ).double().to(device)
         
     elif model_type == 'ExactGP':
@@ -1387,10 +1293,8 @@ def load_model(checkpoint_path, device='cpu'):
     else:
         # Default: SparseH2DispersionGP (SVGP)
         inducing_points = checkpoint['model_state_dict']['variational_strategy.inducing_points'].to(device)
-        use_source_mean = hyperparams.get('use_source_mean', False)
-        model = SparseH2DispersionGP(inducing_points=inducing_points,
-                                     use_source_mean=use_source_mean).double().to(device)
-    
+        model = SparseH2DispersionGP(inducing_points=inducing_points).double().to(device)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     likelihood.load_state_dict(checkpoint['likelihood_state_dict'])
     
@@ -1493,8 +1397,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--config',
         type=str,
-        default='config_training.json',
-        help='Path to the training configuration JSON (default: config_training.json)',
+        default='config_files/config_training.json',
+        help='Path to the training configuration JSON (default: config_files/config_training.json)',
     )
     args = parser.parse_args()
 
@@ -1518,7 +1422,7 @@ if __name__ == "__main__":
     print(f"\nTraining GP model (trainer='{trainer}')...")
 
     if trainer == 'exact':
-        model, likelihood, history = train_h2_dispersion_gp(
+        model, likelihood, history = train_exact_h2_dispersion_gp(
             df=df,
             split_ratio=train_cfg.get('split_ratio', 0.2),
             n_epochs=train_cfg.get('n_epochs', 200),
@@ -1541,9 +1445,7 @@ if __name__ == "__main__":
             model_path=train_cfg.get('model_path'),
             trained_model=train_cfg.get('trained_model'),
             val_every_n_epochs=train_cfg.get('val_every_n_epochs', 10),
-            early_stopping_patience=train_cfg.get('early_stopping_patience', 50),
-            mass_flow_lengthscale_min=train_cfg.get('mass_flow_lengthscale_min', 0.1),
-            use_source_mean=train_cfg.get('use_source_mean', False),
+            early_stopping_patience=train_cfg.get('early_stopping_patience', 50)
         )
 
     print("\nTraining finished.")

@@ -2,14 +2,15 @@
 Build unified datasets for the H2 dispersion pipeline.
 
 Supports two dataset modes (selected in config.json):
-- raw: combine resampled CFD and/or experimental data with minimal processing.
+- raw: combine resampled CFD and/or experimental data with no processing.
 - preprocessed: raw preprocessing plus end-of-release cut-off and release-onset
-  features (t_release, time_since_release, h2_lag_1, optional h2_initial).
+  feature (time_since_release).
 """
 
 import pandas as pd
 import numpy as np
 from scipy import signal
+import argparse
 import re
 import json
 import logging
@@ -38,36 +39,38 @@ CFD_MASS_FLOW = {
     'F': 0.74, 'G': 1.00, 'H': 1.27, 'O1': 0.091, 'O2': 0.45,
 }
 
-# Experimental mass flow start
-FORTY_SEC_START = ['23_FFI_P101_T00003', '23_FFI_P101_T00005', 
-                           '23_FFI_P101_T00006', '23_FFI_P101_T00009']
+# release duration
+HUNDRED_TWENTY = ['23_FFI_P101_T00014', '23_FFI_P101_T00012', '23_FFI_P101_T00013', '23_FFI_P101_T00026', '23_FFI_P101_T00004',
+                  '23_FFI_P101_T00027', '23_FFI_P101_T00027 2' , '23_FFI_P101_T00028', '23_FFI_P101_T00029', '23_FFI_P101_T00030', '23_FFI_P101_T00031']
 
-THIRTY_FIVE_SEC_START = ['23_FFI_P101_T00004', '23_FFI_P101_T00007', 
-                           '23_FFI_P101_T00008', '23_FFI_P101_T00011',
-                           '23_FFI_P101_T00012', '23_FFI_P101_T00013',
-                           '23_FFI_P101_T00014', '23_FFI_P101_T00026',
-                           '23_FFI_P101_T00027', '23_FFI_P101_T00027 2',
-                           '23_FFI_P101_T00028', '23_FFI_P101_T00029',
-                           '23_FFI_P101_T00030', '23_FFI_P101_T00031',
-                           '23_FFI_P101_T00040', '23_FFI_P101_T00041',
-                           '23_FFI_P101_T00042', '23_FFI_P101_T00044',
-                           '23_FFI_P101_T00045']
+SIXTY = ['23_FFI_P101_T00006', '23_FFI_P101_T00003', '23_FFI_P101_T00008', '23_FFI_P101_T00009', '23_FFI_P101_T00007']
 
-# experimental cut-off when experiment is "dead" == leakage stops
-THIRTY_SEC = ['23_FFI_P101_T00005']
-SIXTY_SEC = ['23_FFI_P101_T00003', '23_FFI_P101_T00007', '23_FFI_P101_T00009', '23_FFI_P101_T00006', '23_FFI_P101_T00008']
-NINETY_SEC = ['23_FFI_P101_T00011']
-HUNDRED_TWENTY_SEC = ['23_FFI_P101_T00004', '23_FFI_P101_T00026', '23_FFI_P101_T00027', '23_FFI_P101_T00028', '23_FFI_P101_T00014', '23_FFI_P101_T00012', '23_FFI_P101_T00013', 
-                      '23_FFI_P101_T00029', '23_FFI_P101_T00030', '23_FFI_P101_T00031']
-TWO_HUNDRED_FORTY_SEC = ['23_FFI_P101_T00040', '23_FFI_P101_T00041', '23_FFI_P101_T00042', '23_FFI_P101_T00044', '23_FFI_P101_T00045']
+THIRTY = ['23_FFI_P101_T00005']
+
+NINETY = ['23_FFI_P101_T00011']
+
+TWO_HUNDRED_FOURTY = ['23_FFI_P101_T00041', '23_FFI_P101_T00040', '23_FFI_P101_T00042', '23_FFI_P101_T00045', '23_FFI_P101_T00044']
+
+def build_duration_map() -> dict:
+    """Build a lookup dict: experiment_id -> duration in seconds."""
+    return {
+        **{exp: 120 for exp in HUNDRED_TWENTY},
+        **{exp: 60 for exp in SIXTY},
+        **{exp: 30 for exp in THIRTY},
+        **{exp: 90 for exp in NINETY},
+        **{exp: 240 for exp in TWO_HUNDRED_FOURTY},
+    }
 
 # Splits
 HELD_OUT_TEST_EXPERIMENTS = ['23_FFI_P101_T00006', '23_FFI_P101_T00011', 
                              '23_FFI_P101_T00045', '23_FFI_P101_T00040']
 
 # Threshold for active/inactive sensor classification
-# Values above this threshold are considered "active" (H2 detected)
+# Values above this threshold are considered "active" (H2 detected).
 ACTIVE_THRESHOLD = 0.009
+
+# Fixed H2 release source location (used for source-relative coordinates)
+SOURCE_LOCATION = (0.45, 0.5, 0.8)
 
 SENSOR_POSITIONS = {
     1: (0.77, 0.24, 0.8), 2: (0.46, 0.0, 0.8), 3: (0.48, 0.25, 0.52),
@@ -93,13 +96,11 @@ def load_config(config_path: str = 'config.json') -> dict:
     default_config = {
         "data_sources": {
             "include_experiments": True,
-            "include_cfd": False,
+            "include_cfd": True,
         },
-        "dataset_type": "raw",
+        "dataset_type": "preprocessed",
         "release_onset": {
-            "threshold": 0.009,
-            "include_initial": False,
-            "include_lag1": True,
+            "threshold": 0.01
         },
         "paths": {
             "data_dir": "data",
@@ -107,8 +108,8 @@ def load_config(config_path: str = 'config.json') -> dict:
             "cfd_dir": "data/CFD",
             "raw_output_csv": "data/unified_raw.csv",
             "raw_output_summary": "data/unified_raw_summary.txt",
-            "preprocessed_output_csv": "data/unified_preprocessed.csv",
-            "preprocessed_output_summary": "data/unified_preprocessed_summary.txt",
+            "preprocessed_output_csv": "data/unified_preprocessed_1e-2.csv",
+            "preprocessed_output_summary": "data/unified_preprocessed_summary_1e-2.txt",
         },
     }
 
@@ -307,16 +308,15 @@ def assign_split(df, exp_name):
 
 def add_release_onset_features(
     df: pd.DataFrame,
-    threshold: float = 0.009,
-    include_initial: bool = False,
-    include_lag1: bool = True,
+    skip_missing_durations: bool = True,
+    threshold: float = 0.009
 ) -> pd.DataFrame:
     """
     Add release-onset features to a unified raw DataFrame.
 
     For each scenario the first time any sensor exceeds ``threshold`` becomes
     ``t_release``. ``time_since_release = time - t_release`` then replaces the
-    original ``time`` column. Optionally adds ``h2_initial`` and ``h2_lag_1``.
+    original ``time`` column.
 
     Parameters
     ----------
@@ -325,10 +325,6 @@ def add_release_onset_features(
         'time' and 'h2_volume_fraction' columns.
     threshold : float
         H2 volume-fraction threshold used to detect the release onset.
-    include_initial : bool
-        Whether to add an ``h2_initial`` column per (scenario, experiment, sensor).
-    include_lag1 : bool
-        Whether to add ``h2_lag_1`` and drop rows where it is missing.
 
     Returns
     -------
@@ -336,6 +332,21 @@ def add_release_onset_features(
         Preprocessed dataset with ``time_since_release`` instead of ``time``.
     """
     df = df.copy()
+    duration_map = build_duration_map()
+
+    # Map durations to experiments
+    df['duration'] = df['experiment_id'].map(duration_map)
+    
+    missing = df[df['duration'].isna()]['experiment_id'].unique()
+    if len(missing) > 0:
+        if skip_missing_durations:
+            # For CFD and others without duration entries: set duration to infinity so the cutoff mask keeps all their data
+            df['duration'] = df['duration'].fillna(float('inf'))
+            print(f"Note: no duration for {len(missing)} experiment(s), keeping all data: {list(missing)}")
+        else:
+            raise ValueError(
+                f"No release duration found for {len(missing)} experiment(s): {list(missing)}"
+            )
 
     # Per-scenario release onset: first time any sensor exceeds threshold
     active = df[df['h2_volume_fraction'] > threshold]
@@ -363,43 +374,39 @@ def add_release_onset_features(
     # Time since release replaces the original time coordinate
     df['time_since_release'] = df['time'] - df['t_release']
 
+    # CUTOFF: keep only during active release
+    # 0 <= time_since_release <= duration
+    mask = (df['time_since_release'] >= 0) & (df['time_since_release'] <= df['duration'])
+    
+    n_before = len(df)
+    df = df[mask].copy()
+    n_cut = n_before - len(df)
+    
+    print(f"Cutoff: removed {n_cut:,} rows ({n_before:,} -> {len(df):,})")
+
     group_cols = ['scenario', 'experiment_id', 'sensor_id']
-    df = df.sort_values(group_cols + ['time'])
-
-    # Optional: initial condition at t_release
-    if include_initial:
-        df['time_diff_to_release'] = (df['time'] - df['t_release']).abs()
-        idx_closest = df.groupby(group_cols)['time_diff_to_release'].idxmin()
-        initial_conditions = df.loc[
-            idx_closest, group_cols + ['h2_volume_fraction']
-        ].copy()
-        initial_conditions = initial_conditions.rename(
-            columns={'h2_volume_fraction': 'h2_initial'}
-        )
-        df = df.merge(initial_conditions, on=group_cols, how='left')
-        df = df.drop(columns=['time_diff_to_release'])
-
-    # Optional: lag-1 concentration
-    if include_lag1:
-        df['h2_lag_1'] = df.groupby(group_cols)['h2_volume_fraction'].shift(1)
-        n_before = len(df)
-        df = df.dropna(subset=['h2_lag_1'])
-        logger.info(
-            f"Dropped {n_before - len(df)} rows with missing h2_lag_1"
-        )
+    df = df.sort_values(group_cols + ['time_since_release'])
 
     # Replace the original time column with time_since_release
-    df = df.drop(columns=['time'])
+    df = df.drop(columns=['time', 't_release', 'duration'])
 
     return df
 
 
 def main():
-    config = load_config()
+    parser = argparse.ArgumentParser(
+        description="Build the unified dataset from a JSON config.")
+    parser.add_argument('--config', default='config_files/config.json',
+                        help="Path to the dataset configuration JSON (default: config_files/config.json)")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
     data_sources = config['data_sources']
     paths = config['paths']
     dataset_type = config.get('dataset_type', 'raw')
     release_onset_cfg = config.get('release_onset', {})
+    # The exposure (active) threshold always follows the release-onset
+    active_threshold = release_onset_cfg.get('threshold', ACTIVE_THRESHOLD)
 
     if dataset_type not in ('raw', 'preprocessed'):
         raise ValueError(
@@ -408,7 +415,7 @@ def main():
         )
 
     # Resolve relative paths against the config file location, falling back to CWD
-    config_file = Path('config.json').resolve()
+    config_file = Path(args.config).resolve()
     base_dir = config_file.parent if config_file.exists() else Path.cwd()
     data_dir = base_dir / paths['data_dir']
     cfd_dir = base_dir / paths['cfd_dir']
@@ -520,12 +527,21 @@ def main():
     df_all = pd.concat(all_data, ignore_index=True)
 
     # Add active/inactive label based on H2 volume fraction threshold
-    df_all['active'] = (df_all['h2_volume_fraction'] > ACTIVE_THRESHOLD).astype(int)
+    df_all['active'] = (df_all['h2_volume_fraction'] > active_threshold).astype(int)
     n_active = df_all['active'].sum()
     n_inactive = len(df_all) - n_active
-    logger.info(f"Active/inactive label added (threshold={ACTIVE_THRESHOLD})")
+    logger.info(f"Active/inactive label added (threshold={active_threshold})")
     logger.info(f"  Active:   {n_active:,} ({100*n_active/len(df_all):.1f}%)")
     logger.info(f"  Inactive: {n_inactive:,} ({100*n_inactive/len(df_all):.1f}%)")
+
+    # Source-relative coordinates
+    df_all['x_rel'] = df_all['x'] - SOURCE_LOCATION[0]
+    df_all['y_rel'] = df_all['y'] - SOURCE_LOCATION[1]
+    df_all['z_rel'] = df_all['z'] - SOURCE_LOCATION[2]
+    logger.info(
+        f"Added source-relative coordinates w.r.t. source {SOURCE_LOCATION}: "
+        "x_rel, y_rel, z_rel"
+    )
 
     # ------------------------------------------------------------------
     # Release-onset preprocessing (preprocessed mode only)
@@ -534,9 +550,7 @@ def main():
         logger.info("Adding release-onset features...")
         df_all = add_release_onset_features(
             df_all,
-            threshold=release_onset_cfg.get('threshold', 0.009),
-            include_initial=release_onset_cfg.get('include_initial', False),
-            include_lag1=release_onset_cfg.get('include_lag1', True),
+            threshold=release_onset_cfg.get('threshold', 0.009)
         )
 
         n_before_release = (df_all['time_since_release'] < 0).sum()
@@ -606,7 +620,7 @@ def main():
     summary_lines.append("\nOverall Statistics:")
     summary_lines.append("-" * 40)
     summary_lines.append(f"Sources: {df_all['source'].value_counts().to_dict()}")
-    summary_lines.append(f"\nActive/Inactive (threshold={ACTIVE_THRESHOLD}):")
+    summary_lines.append(f"\nActive/Inactive (threshold={active_threshold}):")
     summary_lines.append(df_all['active'].value_counts().to_string())
     summary_lines.append(f"\nH2 Volume Fraction by source:")
     summary_lines.append(df_all.groupby('source')['h2_volume_fraction'].describe().to_string())
