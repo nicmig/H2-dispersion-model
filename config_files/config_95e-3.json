@@ -1,0 +1,19 @@
+{
+  "data_sources": {
+    "include_experiments": true,
+    "include_cfd": true
+  },
+  "dataset_type": "preprocessed",
+  "release_onset": {
+    "threshold": 0.0095
+  },
+  "paths": {
+    "data_dir": "data",
+    "experiments_dir": "data/raw",
+    "cfd_dir": "data/CFD",
+    "raw_output_csv": "data/unified_raw.csv",
+    "raw_output_summary": "data/unified_raw_summary.txt",
+    "preprocessed_output_csv": "data/unified_preprocessed_95e-3.csv",
+    "preprocessed_output_summary": "data/unified_preprocessed_summary_95e-3.txt"
+  }
+}
