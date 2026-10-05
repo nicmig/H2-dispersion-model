@@ -1,24 +1,24 @@
 # H2 Dispersion Model
 
-*Additive Gaussian Processes for hydrogen dispersion, powered by an MLP ensemble leakage-rate estimator.*
+*Additive Gaussian Process to predict hydrogen dispersion, powered by an MLP ensemble leakage-rate estimator.*
 
-This repository models the spatiotemporal evolution of released hydrogen by combining CFD simulations and experimental sensor data. It combines leakage-rate estimation via an MLP ensemble and hydrogen dispersion forecasting into a predictive framework.
+This repository models the spatiotemporal evolution of released hydrogen by combining CFD simulations and experimental sensor data. It combines leakage-rate estimation via an MLP ensemble and hydrogen dispersion prediction via an additive Gaussian Process into a two-stage framework.
 
 ## Framework Overview
 
 The model pipeline combines an MLP ensemble for leakage-rate estimation with an additive Gaussian Process for spatiotemporal H₂ concentration prediction.
 
-![Framework](GP_EKF_flow.png)
+![Framework](figs/GP_EKF_flow.png)
 
 ## Experimental Geometry
 
 The CFD and experimental campaigns share the same sensor placement and channel geometry. This is also important to keep in mind for the limitations of this model.
 
-![Sensor Placement](SensorPlacement.png)
+![Sensor Placement](figs/SensorPlacement.png)
 
 ## What it does
 
-- **Predicts** H₂ volume fraction across a 3D sensor field at any time using an **additive Gaussian Process**.
+- **Predicts** H₂ concentration across a 3D sensor field at any time using an **additive Gaussian Process**.
 - **Infers** the leakage mass flow rate from sparse early-time observations via an **MLP ensemble**.
 - **Fuses** CFD scenarios and experimental campaigns into one unified dataset.
 - **Anchors** predictions to a fixed release location and aligns them to the release onset.
@@ -34,7 +34,7 @@ This repository does **not** contain the raw datasets because of their size. The
 
 2. **CFD simulation data** (not publicly available)
    - The CFD scenarios used in the paper were provided by a colleague and are not hosted online.
-   - If you do not have access to this data, set `include_cfd` to `false` in `config.json` and run the pipeline with only the open experimental data.
+   - If you do not have access to this data, set `include_cfd` to `false` in `config_files/config.json` and run the pipeline with only the open experimental data.
 
 ### Expected directory layout
 
@@ -55,7 +55,7 @@ data/
 
 ## Configuration
 
-Pipeline behavior is controlled by `config.json` at the repository root.
+Pipeline behavior is controlled by JSON files in `config_files/`. Dataset creation uses `config_files/config.json`; GP training uses `config_files/config_training.json`.
 
 ### Data sources
 
@@ -77,23 +77,21 @@ Pipeline behavior is controlled by `config.json` at the repository root.
 {
   "dataset_type": "raw",
   "release_onset": {
-    "threshold": 0.009,
-    "include_initial": false,
-    "include_lag1": true
+    "threshold": 0.009
   }
 }
 ```
 
 - `dataset_type`: `"raw"` or `"preprocessed"`.
   - `"raw"`: minimal processing — just resample CFD, convert experimental units, and combine the enabled sources. No time shifting, no end-of-release cut-offs, no release-onset features.
-  - `"preprocessed"`: raw processing plus end-of-release cut-off, per-scenario release onset (`t_release`, `time_since_release`), optional `h2_initial`, and `h2_lag_1`. The original `time` column is replaced by `time_since_release`.
-- `release_onset`: controls the onset detection threshold and optional columns in preprocessed mode.
+  - `"preprocessed"`: raw processing plus end-of-release cut-off, per-scenario release onset (`t_release`, `time_since_release`). The original `time` column is replaced by `time_since_release`.
+- `release_onset`: controls the onset detection and optional columns in preprocessed mode. The `threshold` sets **both** the release-onset detection threshold and the exposure threshold for the `active` sensor flag — they are always the same value.
 
-You can also edit the `paths` section if you prefer to keep data outside the repository root.
+You can also edit the `paths` section if you prefer to keep data outside the repository root. `config_files/config_85e-3.json` and `config_files/config_95e-3.json` are ready-made variants that build the same dataset with thresholds 0.0085 and 0.0095 for the threshold-sensitivity study.
 
 ## Usage
 
-Run the scripts from the repository root. `build_dataset.py` is the single entry point for dataset creation; the mode is selected in `config.json`.
+Run the scripts from the repository root. `build_dataset.py` is the single entry point for dataset creation; the mode is selected in the dataset config.
 
 ### 1. Build the dataset
 
@@ -101,35 +99,45 @@ Run the scripts from the repository root. `build_dataset.py` is the single entry
 python build_dataset.py
 ```
 
-This reads the enabled data sources from `config.json` and writes the dataset chosen by `dataset_type`:
+This reads `config_files/config.json` and writes the dataset chosen by `dataset_type`. To use a different dataset configuration (e.g., another exposure threshold):
+
+```bash
+python build_dataset.py --config config_files/config_85e-3.json
+```
+
+Outputs (file names are set in the config's `paths` section):
 
 - **Raw mode** (`"dataset_type": "raw"`):
   - `data/unified_raw.csv`
   - `data/unified_raw_summary.txt`
 
 - **Preprocessed mode** (`"dataset_type": "preprocessed"`):
-  - `data/unified_preprocessed.csv`
-  - `data/unified_preprocessed_summary.txt`
+  - `data/unified_preprocessed_*.csv`
+  - `data/unified_preprocessed_summary_*.txt`
 
-The preprocessed dataset contains `time_since_release`, `t_release`, and `h2_lag_1` (included by default; set `release_onset.include_lag1` to `false` to disable). The original `time` column is removed because `time_since_release` becomes the temporal coordinate.
+The preprocessed dataset contains `time_since_release`, `t_release`, an `active` exposure flag per sensor reading. The original `time` column is removed because `time_since_release` becomes the temporal coordinate.
 
-### 2. Train the Stage 1 mass-flow estimator
+### 2. Train the Stage 1 leakage-rate estimator
 
 ```bash
 python massflow_estimator.py
 ```
 
-This reads `data/unified_preprocessed.csv` and trains the MLP ensemble used for early-time leakage-rate estimation.
+This reads the preprocessed dataset (the CSV path is set near the top of `main()`), runs leave-one-experiment-out (LOEO) cross-validation with a 7-member MLP ensemble, and then trains the final ensemble on all non-test experiments. Outputs:
+
+- `models/stage1_ensemble.pth` — saved final ensemble (member weights + fitted feature scaler)
+- `validation_viz/stage1_massflow_estimator.pdf` — LOEO results figure
+- `experiments/stage1_massflow_*.json` — metrics summary
 
 ### 3. Train the GP dispersion model
 
-Training is controlled by `config_training.json`. Edit it to choose the trainer, model type, likelihood, hyperparameters, device, and output path. Then run:
+Training is controlled by `config_files/config_training.json`. Edit it to choose the trainer, model type, likelihood, hyperparameters, device, and output path. Then run:
 
 ```bash
-python h2_dispersion_gp.py
+python h2_dispersion_gp.py --config config_files/config_training.json
 ```
 
-or with a custom config file:
+or with any other config file:
 
 ```bash
 python h2_dispersion_gp.py --config my_config.json
@@ -139,7 +147,7 @@ python h2_dispersion_gp.py --config my_config.json
 
 The `trainer` field selects the training function:
 
-- `"approximate_additive"` (default): SVGP or VNNGP with the additive kernel. Requires the preprocessed dataset (`data/unified_preprocessed.csv`) with `time_since_release` and `h2_lag_1`.
+- `"approximate_additive"` (default): SVGP or VNNGP with the additive kernel. Requires the preprocessed dataset (`data/unified_preprocessed_*.csv`) with `time_since_release`.
 - `"exact"`: Standard Exact GP. Works with the raw dataset (`data/unified_raw.csv`) using `time`, `mass_flow`, `x`, `y`, `z`.
 
 #### Model / likelihood combinations
@@ -149,26 +157,25 @@ For `approximate_additive` you can select:
 - `model_type`: `"SVGP"` or `"VNNGP"`
 - `likelihood_type`: `"gaussian"` or `"beta"`
 
-VNNGP with a Beta likelihood was used for the final model in the publication.
+SVGP with a Beta likelihood was used for the final model in the publication.
 
 #### Example `approximate_additive` config
 
 ```json
 {
   "data": {
-    "csv_path": "data/unified_preprocessed.csv"
+    "csv_path": "data/unified_preprocessed_9e-3.csv"
   },
   "training": {
     "trainer": "approximate_additive",
-    "model_type": "VNNGP",
+    "model_type": "SVGP",
     "likelihood_type": "beta",
     "n_inducing": 6000,
-    "k": 16,
     "training_batch_size": 1024,
-    "n_epochs": 300,
-    "learning_rate": 0.008,
+    "n_epochs": 200,
+    "learning_rate": 0.085,
     "device": "cuda:0",
-    "model_path": "models/approximate_indvAdditive_vnngp_rbf_k16_beta_300_lr8e-3.pth"
+    "model_path": "models/approximate_indvAdditive_svgp_rbf_6000_beta.pth"
   }
 }
 ```
@@ -190,16 +197,29 @@ VNNGP with a Beta likelihood was used for the final model in the publication.
 }
 ```
 
-#### Background training script
+### 4. Evaluate the two-stage framework end-to-end
 
-`run_training.sh` is the author's personal unattended-training launcher and is listed in `.gitignore`. It is not part of the public reproducible workflow, but you can use it as a template for your own background-training wrapper if you wish.
+```bash
+python evaluate_two_stage.py
+```
+
+This loads the saved Stage 1 ensemble (`models/stage1_ensemble.pth`) and a trained Stage 2 GP checkpoint, then evaluates on the held-out test experiments twice: once with the true leakage rate (oracle) and once with the Stage 1 predictions (full two-stage pipeline). It reports MAE/RMSE/NLL on all test sensors and on exposed (`active`) sensors only, plus per-experiment metrics, and writes `experiments/two_stage_eval_*.json`.
+
+Useful flags: `--csv` (dataset), `--gp-checkpoint` (one or more GP checkpoints), `--retrain-stage1`, `--device`.
+
+### 5. Calibration analysis of the GP model
+
+```bash
+python calibrate_gp.py
+```
+
+This loads a trained GP checkpoint and computes uncertainty-calibration metrics on the held-out test set: prediction interval coverage probability (PICP) at several nominal levels, mean interval widths, and a PIT histogram / calibration curve. The figure is saved to `visualizations/gp_calibration.pdf`. Useful flags: `--checkpoint`, `--csv`, `--device`.
 
 ## Dependencies
 
-The code is written in Python and relies on the following packages. A full list is provided in `requirements.txt`.
+The code is written in Python (developed and tested with Python 3.12; 3.11+ required by the pinned package versions) and relies on the following packages. A full list with the tested versions is provided in `requirements.txt`.
 
 Core numerical / ML stack:
-- Python 3.9+
 - PyTorch
 - GPyTorch
 - pandas
@@ -226,7 +246,7 @@ The repository includes `data_analysis.ipynb` and `kernel_analysis.ipynb` for ex
 
 ## License
 
-This repository is provided as a complement to the journal publication. Please cite the paper if you use the code in your own work. Please cite the dataset if you use the data in your own work:
+This repository is provided as a complement to the journal publication that will be linked here when it is published. Please cite the paper if you use the code in your own work. Please also cite the dataset if you use the data in your own work:
 
 ```
 @data{USN.26117989_2025,
